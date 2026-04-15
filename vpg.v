@@ -1,17 +1,17 @@
 module vpg
 
-#include "@VMODROOT/vpg/vpg.h"
+#include "@VMODROOT/vpg.h"
 
 #flag -I @VMODROOT/postgresql/installed/include/server
 #flag -I @VMODROOT/postgresql/installed/include/internal
 #flag -I @VMODROOT/postgresql/src/include
 #flag -I @VMODROOT/postgresql/src/backend
-#flag -I @VMODROOT/vpg
-#flag -L @VMODROOT/vpg
+#flag -I @VMODROOT
+#flag -L @VMODROOT
 #flag -L @VMODROOT/postgresql/src/interfaces/libpq
 #flag -L @VMODROOT/postgresql/installed/lib
 #flag -L /opt/homebrew/opt/icu4c@78/lib
-#flag @VMODROOT/vpg/libvpg.a
+#flag @VMODROOT/libvpg.a
 #flag @VMODROOT/postgresql/src/common/libpgcommon_srv.a
 #flag @VMODROOT/postgresql/src/port/libpgport_srv.a
 #flag -lpq
@@ -22,6 +22,7 @@ module vpg
 #flag -lz
 #flag -lm
 
+fn C.vpg_initdb(data_dir &char, username &char)
 fn C.vpg_init(data_dir &char, username &char, dbname &char)
 fn C.vpg_exec(query &char) &char
 fn C.vpg_last_error_message() &char
@@ -44,6 +45,13 @@ fn c_error_string() string {
 		return 'unknown vpg error'
 	}
 	return unsafe { cstring_to_vstring(msg) }
+}
+
+pub fn initdb(data_dir string, user string) ! {
+	C.vpg_initdb(data_dir.str, user.str)
+	if C.vpg_last_error_message() != 0 {
+		return error(c_error_string())
+	}
 }
 
 pub fn new_pg_embedded(data_dir string, user string, db string) !PGEmbedded {

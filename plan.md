@@ -52,7 +52,45 @@ Create a single-process version of PostgreSQL by wrapping the existing PostgreSQ
   - `current_database,current_user`
   - `postgres,embed_user`
 
-## What's Next
+## In-Process Database Initialisation (vpg_initdb)
+
+**Problem:** End users cannot be expected to run `initdb` externally before using the library.
+An embedded database must be able to create its own data directory from scratch.
+
+**Approach — copy & modify initdb.c, no external binary:**
+
+PostgreSQL's `initdb` tool bootstraps a data directory by:
+1. Creating the on-disk directory structure.
+2. Running `postgres --boot` (bootstrap mode) to build template1 from the BKI file.
+3. Running `postgres --single` (standalone mode) several times to set up auth, system
+   functions, views, etc.
+
+Both sub-steps spawn a new `postgres` process via `popen`/`pclose`.  In a single-process
+embedded build we eliminate those forks of an external binary:
+
+| Original initdb | vpg_initdb |
+|---|---|
+| `popen("postgres --boot …", "w")` | `fork()` + `BootstrapModeMain()` in child |
+| `popen("postgres --single …", "w")` | `fork()` + `PostgresSingleUserMain()` in child |
+| `system("postgres --check …")` | **removed** — `test_config_settings()` replaced with hardcoded embedded defaults |
+| `find_other_exec()` to locate postgres binary | **removed** — `setup_bin_paths()` sets `backend_exec` to the current executable |
+
+`fork()` is used only during the one-time initialisation phase; the child exits via the
+normal `proc_exit()` path so there is no need to intercept `exit()`.  After `vpg_initdb()`
+returns the main process is the sole single-process postgres instance.
+
+**Files:**
+- `vpg_initdb.c` — modified copy of `src/bin/initdb/initdb.c`
+- `vpg_findtimezone.c` — copy of `src/bin/initdb/findtimezone.c` (timezone detection)
+- `vpg_localtime.c` — copy of `src/timezone/localtime.c` (timezone tables)
+- `vpg.c` / `vpg.h` / `vpg.v` — `vpg_initdb()` C function + V wrapper `vpg.initdb()`
+
+**V API:**
+```v
+vpg.initdb(data_dir, username)!   // create data dir; call once before new_pg_embedded
+```
+
+
 
 ### Immediate Next Steps
 1. **Refine the API**

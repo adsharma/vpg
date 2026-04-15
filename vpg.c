@@ -122,6 +122,31 @@ vpg_last_error_message(void)
 	return vpg_last_error;
 }
 
+extern int vpg_initdb_run(int argc, char *argv[]);  /* from vpg_initdb.c */
+
+void
+vpg_initdb(const char *data_dir, const char *username)
+{
+	char *av[16];
+	int   ac = 0;
+
+	vpg_replace_owned_string(&vpg_last_error, NULL);
+
+	av[ac++] = "vpg_initdb";
+	av[ac++] = "-D";
+	av[ac++] = (char *) data_dir;
+	av[ac++] = "-U";
+	av[ac++] = (char *) username;
+	av[ac++] = "--auth=trust";
+	av[ac++] = "--encoding=UTF8";
+	av[ac++] = "--locale=C";
+	av[ac]   = NULL;
+
+	int rc = vpg_initdb_run(ac, av);
+	if (rc != 0)
+		vpg_replace_owned_string(&vpg_last_error, "vpg_initdb failed");
+}
+
 void
 vpg_init(const char *data_dir, const char *username, const char *dbname)
 {

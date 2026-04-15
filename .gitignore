@@ -1,0 +1,7 @@
+data/
+libvpg.a
+vpg.o
+test_vpg
+test_vpg_bin
+*.dSYM/
+*.o

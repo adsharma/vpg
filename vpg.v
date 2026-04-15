@@ -15,8 +15,6 @@ module vpg
 #flag @VMODROOT/postgresql/src/common/libpgcommon_srv.a
 #flag @VMODROOT/postgresql/src/port/libpgport_srv.a
 #flag -lpq
-#flag -lpgcommon
-#flag -lpgport
 #flag -licui18n
 #flag -licuuc
 #flag -lz

@@ -74,7 +74,7 @@ vpg_strdup_result(const char *value)
 	return strdup(value != NULL ? value : "");
 }
 
-static const char *
+const char *
 vpg_get_exec_path(void)
 {
 	uint32_t size = 0;
@@ -131,6 +131,7 @@ vpg_initdb(const char *data_dir, const char *username)
 	int   ac = 0;
 
 	vpg_replace_owned_string(&vpg_last_error, NULL);
+	vpg_runtime_init();   /* ensure MemoryContextInit before any palloc */
 
 	av[ac++] = "vpg_initdb";
 	av[ac++] = "-D";

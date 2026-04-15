@@ -49,6 +49,7 @@
 /*
  * VPG: This is a modified copy of initdb.c for single-process embedded use.
  * Key changes from upstream:
+ *   - postgres_fe.h replaced with postgres.h — single process, single ABI.
  *   - popen/pclose replaced with fork + direct calls to BootstrapModeMain /
  *     PostgresSingleUserMain (no exec, no external postgres binary needed).
  *   - test_config_settings() replaced with hardcoded embedded defaults.
@@ -56,10 +57,19 @@
  *   - main() renamed to vpg_initdb_run(), called from vpg.c.
  */
 
-#include "postgres_fe.h"
+#include "postgres.h"
+#include "common/fe_memutils.h"
+#include "common/file_utils.h"
+#include "common/logging.h"
+#include "utils/memutils.h"
 
 #include <sys/wait.h>
 #include <unistd.h>
+
+/* VPG: sync_pgdata declared under #ifdef FRONTEND; forward-declare for backend build */
+extern void sync_pgdata(const char *pg_data, int serverVersion,
+						DataDirSyncMethod sync_method, bool sync_data_files);
+extern void sync_dir_recurse(const char *dir, DataDirSyncMethod sync_method);
 
 /*
  * VPG: forward-declare the backend entry points we call in-process.
@@ -165,6 +175,15 @@ vpg_popen_w(const char *cmd)
 		if (dup2(pipefd[0], STDIN_FILENO) < 0)
 			_exit(1);
 		close(pipefd[0]);
+
+		/*
+		 * Reset the memory context inherited from the parent so that
+		 * BootstrapModeMain / PostgresSingleUserMain can call
+		 * MemoryContextInit() cleanly (it asserts TopMemoryContext == NULL).
+		 */
+		TopMemoryContext = NULL;
+		CurrentMemoryContext = NULL;
+		ErrorContext = NULL;
 
 		/*
 		 * Dispatch on argv[1]: --boot → BootstrapModeMain,

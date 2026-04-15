@@ -61,8 +61,8 @@ pg_TZDIR(void)
  * given name is stored there (the buffer must be > TZ_STRLEN_MAX bytes!).
  * This is redundant but kept for compatibility with the backend code.
  */
-int
-pg_open_tzfile(const char *name, char *canonname)
+static int
+vpg_open_tzfile(const char *name, char *canonname)
 {
 	char		fullname[MAXPGPATH];
 

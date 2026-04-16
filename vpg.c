@@ -133,7 +133,7 @@ vpg_initdb(const char *data_dir, const char *username)
 	vpg_replace_owned_string(&vpg_last_error, NULL);
 	vpg_runtime_init();   /* ensure MemoryContextInit before any palloc */
 
-	av[ac++] = "vpg_initdb";
+	av[ac++] = (char *) vpg_get_exec_path();
 	av[ac++] = "-D";
 	av[ac++] = (char *) data_dir;
 	av[ac++] = "-U";
@@ -141,18 +141,19 @@ vpg_initdb(const char *data_dir, const char *username)
 	av[ac++] = "--auth=trust";
 	av[ac++] = "--encoding=UTF8";
 	av[ac++] = "--locale=C";
+	av[ac++] = "--no-instructions";
 	av[ac]   = NULL;
 
 	int rc = vpg_initdb_run(ac, av);
 	if (rc != 0)
 		vpg_replace_owned_string(&vpg_last_error, "vpg_initdb failed");
+	else
+		vpg_initialized = true;
 }
 
 void
 vpg_init(const char *data_dir, const char *username, const char *dbname)
 {
-	char	   *av[10];
-	int			ac = 0;
 	const char *effective_dbname;
 
 	if (vpg_initialized)
@@ -161,23 +162,17 @@ vpg_init(const char *data_dir, const char *username, const char *dbname)
 	vpg_replace_owned_string(&vpg_last_error, NULL);
 	vpg_runtime_init();
 
-		av[ac++] = (char *) vpg_get_exec_path();
-	av[ac++] = "-D";
-	av[ac++] = (char *) data_dir;
-	av[ac++] = "-c";
-	av[ac++] = "shared_preload_libraries=";
-	av[ac] = NULL;
-
 	effective_dbname = (dbname != NULL && dbname[0] != '\0') ? dbname : username;
 
 	PG_TRY();
 	{
 		Assert(!IsUnderPostmaster);
 
-		progname = av[0];
-		InitStandaloneProcess(av[0]);
+		progname = vpg_get_exec_path();
+		InitStandaloneProcess(progname);
 		InitializeGUCOptions();
-		process_postgres_switches(ac, av, PGC_POSTMASTER, NULL);
+		SetConfigOption("data_directory", data_dir, PGC_POSTMASTER, PGC_S_ARGV);
+		SetConfigOption("shared_preload_libraries", "", PGC_POSTMASTER, PGC_S_ARGV);
 
 		if (effective_dbname == NULL || effective_dbname[0] == '\0')
 			ereport(ERROR,
@@ -324,5 +319,20 @@ vpg_exec(const char *query)
 void
 vpg_finish(void)
 {
+	if (!vpg_initialized)
+		return;
+
+	PG_TRY();
+	{
+		AbortOutOfAnyTransaction();
+		shmem_exit(0);
+	}
+	PG_CATCH();
+	{
+		vpg_capture_current_error();
+		FlushErrorState();
+	}
+	PG_END_TRY();
+
 	vpg_initialized = false;
 }

@@ -92,6 +92,8 @@ vpg_bootstrap(const char *data_dir,
               const char *exec_path)
 {
     int         rc = 0;
+    volatile int saved_stdin_fd = -1;
+    volatile int devnull_fd = -1;
 
     PG_TRY();
     {
@@ -212,7 +214,7 @@ vpg_bootstrap(const char *data_dir,
         }
         free(bki_lines);
 
-        /* Open in-memory stream — no temp file, no stdin redirect */
+        /* Open in-memory stream — no temp file */
         bki_stream = fmemopen(bki_concat, total_len, "r");
         if (bki_stream == NULL)
             ereport(ERROR,
@@ -224,9 +226,33 @@ vpg_bootstrap(const char *data_dir,
 
         boot_yyset_in(bki_stream, scanner);
 
+        /*
+         * Keep PostgreSQL source untouched: temporarily make stdin non-tty
+         * so bootparse's isatty(0) prompt path stays silent.
+         */
+        saved_stdin_fd = dup(STDIN_FILENO);
+        if (saved_stdin_fd >= 0)
+        {
+            devnull_fd = open("/dev/null", O_RDONLY);
+            if (devnull_fd >= 0)
+                (void) dup2(devnull_fd, STDIN_FILENO);
+        }
+
         StartTransactionCommand();
         boot_yyparse(scanner);
         CommitTransactionCommand();
+
+        if (saved_stdin_fd >= 0)
+        {
+            (void) dup2(saved_stdin_fd, STDIN_FILENO);
+            close(saved_stdin_fd);
+            saved_stdin_fd = -1;
+        }
+        if (devnull_fd >= 0)
+        {
+            close(devnull_fd);
+            devnull_fd = -1;
+        }
 
         fclose(bki_stream);
         pfree(bki_concat);
@@ -237,6 +263,17 @@ vpg_bootstrap(const char *data_dir,
     PG_CATCH();
     {
         ErrorData *edata = CopyErrorData();
+        if (saved_stdin_fd >= 0)
+        {
+            (void) dup2(saved_stdin_fd, STDIN_FILENO);
+            close(saved_stdin_fd);
+            saved_stdin_fd = -1;
+        }
+        if (devnull_fd >= 0)
+        {
+            close(devnull_fd);
+            devnull_fd = -1;
+        }
         snprintf(vpg_bootstrap_errmsg, sizeof(vpg_bootstrap_errmsg),
                  "%s", edata->message ? edata->message : "unknown bootstrap error");
         FlushErrorState();

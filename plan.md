@@ -1,141 +1,355 @@
-# vPG Project Plan
+# vPG – Single-Process Embedded PostgreSQL Plan
 
 ## Goal
-Create a single-process version of PostgreSQL by wrapping the existing PostgreSQL code using Vlang as the glue code. The aim is to interface with the existing C code (PostgreSQL 18.1) and provide a simple API to run SQL queries without needing a separate server process.
 
-## Steps Completed
+A SQLite3-like embedded database engine: one C library + a thin Vlang API.
+No server process, no network, no fork/exec, no signals, no pipes.
+Single connection (like SQLite in WAL mode with one writer).
 
-1. **Source Acquisition**
-   - Cloned PostgreSQL repository and checked out the REL_18_1 tag (PostgreSQL 18.1).
-   - Examined the source structure, focusing on the backend and main entry points.
+The inspiration is [PGlite](https://pglite.dev) — PostgreSQL compiled to WASM and
+stripped of its process model — but done natively with a C + Vlang approach.
 
-2. **Understanding the Entry Points**
-   - Identified `PostgresSingleUserMain` in `src/backend/tcop/postgres.c` as the entry point for single-user mode.
-   - Reviewed the initialization sequence in `PostgresSingleUserMain` and `PostgresMain`.
-   - Looked at the Server Programming Interface (SPI) as a potential way to execute queries.
+---
 
-3. **Building PostgreSQL**
-   - Installed dependencies (icu4c via Homebrew).
-   - Configured and built PostgreSQL 18.1 with `./configure --prefix=$(pwd)/installed` and `make -j4 install`.
-   - The built libraries and headers are located in `vpg/postgresql/installed`.
+## What the current code does wrong
 
-4. **Setting Up the Data Directory**
-   - Created a data directory in `vpg/data` using `initdb` from the built PostgreSQL.
-   - Created a database and user for embedded use.
+The current `vpg_initdb.c` still forks children and uses pipes to communicate
+with them (via `vpg_popen_w`).  It calls `BootstrapModeMain` and
+`PostgresSingleUserMain` which are `__attribute__((noreturn))` — they always
+end with `proc_exit()`.  Replacing those with `setjmp`/`longjmp` is fragile
+and hard to reason about.
 
-5. **Initial Vlang Wrapper**
-   - Created a Vlang module (`vpg.v`) that declares external functions to be implemented in C.
-   - Wrote a C shim (`vpg.c`) that initializes the PostgreSQL backend in standalone mode and provides a function to execute queries via SPI.
-   - The C shim includes:
-     - Initialization following the sequence from `PostgresSingleUserMain`.
-     - A custom DestReceiver to capture query results (though we switched to using SPI directly for simplicity).
-     - Error handling (simplified).
-     - A `vpg_exec` function that uses SPI to execute a query and returns the result as a CSV string.
-   - Created a simple Vlang API (`vpg.v`) with:
-     - `new_pg_embedded` to initialize the embedded Postgres.
-     - `query` method to run SQL and return results.
-     - `close` method to clean up.
+The right fix is to **not call those entry points at all**.  They are
+convenience wrappers.  The real work is done by the internal functions they
+call, and those functions return normally.
 
-6. **Testing the C Shims**
-   - Created a test C program (`test.c`) that calls the vpg_init, vpg_exec, and vpg_finish functions.
-   - Added a local `Makefile` that links the shim against the built PostgreSQL backend object tree.
-   - Verified that the test harness builds and can initialize the embedded backend, connect to the default `postgres` database, and execute a simple `SELECT` via SPI.
+---
 
-## What Has Been Done
-- PostgreSQL 18.1 built and installed locally.
-- Data directory initialized.
-- Vlang module and C shim created with basic skeleton.
-- Initial API designed.
-- C shim rewritten to follow the real standalone backend startup path instead of placeholder initialization.
-- Runtime error capture now uses `PG_TRY`/`PG_CATCH` with copied PostgreSQL error messages returned to the caller.
-- Test harness now proves end-to-end query execution in-process:
-  - `current_database,current_user`
-  - `postgres,embed_user`
+## Architecture
 
-## In-Process Database Initialisation (vpg_initdb)
-
-**Problem:** End users cannot be expected to run `initdb` externally before using the library.
-An embedded database must be able to create its own data directory from scratch.
-
-**Approach — copy & modify initdb.c, no external binary:**
-
-PostgreSQL's `initdb` tool bootstraps a data directory by:
-1. Creating the on-disk directory structure.
-2. Running `postgres --boot` (bootstrap mode) to build template1 from the BKI file.
-3. Running `postgres --single` (standalone mode) several times to set up auth, system
-   functions, views, etc.
-
-Both sub-steps spawn a new `postgres` process via `popen`/`pclose`.  In a single-process
-embedded build we eliminate those forks of an external binary:
-
-| Original initdb | vpg_initdb |
-|---|---|
-| `popen("postgres --boot …", "w")` | `fork()` + `BootstrapModeMain()` in child |
-| `popen("postgres --single …", "w")` | `fork()` + `PostgresSingleUserMain()` in child |
-| `system("postgres --check …")` | **removed** — `test_config_settings()` replaced with hardcoded embedded defaults |
-| `find_other_exec()` to locate postgres binary | **removed** — `setup_bin_paths()` sets `backend_exec` to the current executable |
-
-`fork()` is used only during the one-time initialisation phase; the child exits via the
-normal `proc_exit()` path so there is no need to intercept `exit()`.  After `vpg_initdb()`
-returns the main process is the sole single-process postgres instance.
-
-**Files:**
-- `vpg_initdb.c` — modified copy of `src/bin/initdb/initdb.c`
-- `vpg_findtimezone.c` — copy of `src/bin/initdb/findtimezone.c` (timezone detection)
-- `vpg_localtime.c` — copy of `src/timezone/localtime.c` (timezone tables)
-- `vpg.c` / `vpg.h` / `vpg.v` — `vpg_initdb()` C function + V wrapper `vpg.initdb()`
-
-**V API:**
-```v
-vpg.initdb(data_dir, username)!   // create data dir; call once before new_pg_embedded
+```
+┌────────────────────────────────────┐
+│  Vlang API  (vpg.v)                │  ← user-facing: initdb / open / exec / close
+└───────────────┬────────────────────┘
+                │ C FFI
+┌───────────────▼────────────────────┐
+│  C control layer  (vpg.c)          │  ← thin glue; no process management
+│  vpg_initdb()                      │
+│  vpg_init()                        │
+│  vpg_exec()                        │
+│  vpg_finish()                      │
+└───────────────┬────────────────────┘
+                │ direct C calls
+┌───────────────▼────────────────────┐
+│  PostgreSQL internals (libvpg.a)   │  ← storage, catalog, SPI, parser, planner,
+│                                    │    executor, WAL, GUC, memory contexts
+└────────────────────────────────────┘
 ```
 
+---
 
+## What stays as PostgreSQL C (untouched)
 
-### Immediate Next Steps
-1. **Refine the API**
-   - Consider returning structured data (e.g., array of maps) instead of CSV strings for easier use in Vlang.
-   - Decide how `vpg_finish` should cleanly tear down backend resources without terminating the host process.
-   - Add support for parameterized queries.
+Everything below the "entry point" layer is a clean library:
 
-2. **Tighten Build and Runtime Assumptions**
-   - Reduce the current broad backend-object link list to the minimal supported server link set.
-   - Decide whether the wrapper should always connect to `postgres` first or create/select an application database automatically.
-   - Document the need for an unrestricted runtime when shared memory creation is sandboxed.
+| Subsystem | Key files |
+|-----------|-----------|
+| Memory contexts | `utils/mmgr/` |
+| GUC (config) | `utils/misc/guc*.c` |
+| Storage / buffer manager | `storage/` |
+| Catalog | `catalog/` |
+| Parser | `parser/` |
+| Planner | `optimizer/` |
+| Executor | `executor/` |
+| SPI | `executor/spi.c` |
+| WAL | `access/transam/xlog.c` |
+| Transactions | `access/transam/xact.c` |
+| Bootstrap parser | `bootstrap/bootparse.y`, `bootstrap/bootscanner.l` |
 
-3. **Developer Ergonomics**
-   - Fold the V test flow into `vpg/Makefile` or a small build script so the `make` and `v` steps are not manual.
-   - Clean up the V naming/API surface (`new_pg_embedded`, `query`, `close`) and decide what should be public and stable.
-   - Add a README example that matches the now-working C and V harnesses.
+We compile all of this into `libvpg.a` exactly as we do today.
 
-### Longer-Term Goals
-- **Performance and Robustness**
-  - Ensure the embedded Postgres can handle multiple queries and transactions.
-  - Test with various SQL commands (DDL, DML, etc.).
-  - Ensure that the embedded Postgres cleans up resources properly on close.
+---
 
-- **Feature Completeness**
-  - Support for different authentication methods (though in embedded mode we trust the local user).
-  - Ability to set configuration parameters.
-  - Support for reading from and writing to files (e.g., COPY) if needed.
+## What gets rewritten (the process-model layer)
 
-- **Documentation and Examples**
-  - Write comprehensive README with usage examples.
-  - Provide examples of common operations (creating tables, inserting data, querying).
+PostgreSQL's process-model scaffolding lives in three entry points:
 
-- **Testing**
-  - Write a test suite in Vlang to verify functionality.
-  - Test edge cases and error conditions.
+| Entry point | What it does | Our replacement |
+|-------------|-------------|-----------------|
+| `BootstrapModeMain()` | signals, option parsing, calls bootstrap internals, `proc_exit(0)` | `vpg_bootstrap()` in `vpg.c` |
+| `PostgresSingleUserMain()` | signals, option parsing, calls `PostgresMain()`, `proc_exit()` | `vpg_open()` in `vpg.c` |
+| `PostgresMain()` | signal handlers, `sigjmp_buf` REPL loop, `proc_exit(0)` | `vpg_exec()` + `vpg_finish()` in `vpg.c` |
 
-## Notes
-- The project is inspired by PGlite but uses Vlang as the extension language instead of JavaScript/TypeScript.
-- We are using the single-user mode initialization path but aiming to provide a non-interactive, programmatic interface.
-- The use of SPI allows us to avoid dealing with the frontend/backend protocol directly.
+We copy the *sequence of internal calls* from each entry point and drop:
+- All `pqsignal()` / `sigprocmask()` calls
+- The `sigjmp_buf` error-recovery REPL loop
+- All `proc_exit()` / `on_proc_exit()` calls
+- `find_my_exec()` / `find_other_exec()` (no external binary)
 
-## Open Questions
-- How to handle multiple simultaneous queries? (Since we are in a single process, we can only have one active session at a time unless we use background worker-like mechanisms, but for simplicity we assume one query at a time.)
-- How to manage memory contexts effectively to avoid leaks and ensure proper cleanup?
-- What is the best way to capture errors from the PostgreSQL backend and surface them to Vlang?
+Errors are caught at the C/V boundary with `PG_TRY` / `PG_CATCH` and returned
+as strings.  There is no global error-recovery loop.
 
-## Conclusion
-We have made initial progress by building PostgreSQL and creating a basic Vlang-C interface. The next steps are to complete the C shim, integrate it with Vlang, and test the API.
+---
+
+## Phase 1 — `vpg_initdb()`: one-time data directory setup
+
+Replaces `vpg_initdb.c` (currently ~3600 lines with fork/pipe machinery).
+
+### Step 1a: directory + config setup
+
+These functions from `initdb.c` are pure file I/O and need no modification:
+
+```c
+setup_pgdata();           // set pg_data, PGDATA env var
+create_data_directory();  // mkdir
+create_xlog_or_symlink(); // pg_wal subdir
+write_version_file(NULL); // PG_VERSION
+set_null_conf();          // empty postgresql.conf
+setup_config();           // write postgresql.conf, pg_hba.conf, pg_ident.conf
+```
+
+We call `get_share_path()` with the current executable path to locate the
+BKI file and SQL scripts.  No `find_other_exec()` needed.
+
+### Step 1b: `vpg_run_bootstrap()` — replaces `BootstrapModeMain`
+
+```c
+// Sequence copied from BootstrapModeMain, proc_exit and signals removed:
+MemoryContextInit();
+InitializeGUCOptions();
+// set data_dir, encoding, checksums via SetConfigOption()
+SelectConfigFiles(data_dir, "vpg");
+checkDataDir();
+ChangeToDataDir();
+CreateDataDirLockFile(false);
+SetProcessingMode(BootstrapProcessing);
+IgnoreSystemIndexes = true;
+InitializeMaxBackends();
+InitPostmasterChildSlots();
+InitializeFastPathLocks();
+CreateSharedMemoryAndSemaphores();
+set_max_safe_fds();
+InitProcess();
+BaseInit();
+// NO bootstrap_signals()
+BootStrapXLOG(checksum_version);
+InitPostgres(NULL, InvalidOid, NULL, InvalidOid, 0, NULL);
+
+// Feed BKI file content directly — no stdin, no pipe, no fork
+FILE *bki = fopen(bki_file_path, "r");
+yyscan_t scanner;
+boot_yylex_init(&scanner);
+boot_yyset_in(bki, scanner);         // point scanner at the file
+StartTransactionCommand();
+boot_yyparse(scanner);               // runs all bootstrap commands
+CommitTransactionCommand();
+fclose(bki);
+RelationMapFinishBootstrap();
+// NO proc_exit — just return
+```
+
+`boot_yyset_in()` is the flex API to redirect the scanner's input source.
+No stdin redirection, no pipe, no fork.
+
+### Step 1c: `vpg_run_setup_sql()` — replaces popen("--single") calls
+
+After bootstrap, the database is in `BootstrapProcessing` mode.  We switch
+to `NormalProcessing` and run the setup SQL files directly via SPI:
+
+```c
+SetProcessingMode(NormalProcessing);
+// Re-use the already-initialised shared memory and process state.
+// No re-init needed — we are still the same process.
+
+// Run each setup SQL script:
+vpg_exec_file(system_constraints_file);
+vpg_exec_file(system_functions_file);
+vpg_exec_file(system_views_file);
+vpg_exec_file(info_schema_file);
+vpg_exec_file(dictionary_file);
+// Inline SQL (auth, privileges, collations, etc.) via SPI_execute():
+vpg_exec_sql("UPDATE pg_authid SET rolpassword = NULL ...");
+// etc.
+```
+
+```c
+static void
+vpg_exec_file(const char *path)
+{
+    // read file into string, call SPI_execute in a transaction
+    char *sql = read_file(path);
+    SPI_connect();
+    StartTransactionCommand();
+    SPI_execute(sql, false, 0);
+    CommitTransactionCommand();
+    SPI_finish();
+    pfree(sql);
+}
+```
+
+No `PostgresSingleUserMain`, no fork, no pipe.
+
+### Step 1d: teardown
+
+```c
+// Flush WAL, sync, release shared memory
+RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
+ShutdownXLOG(0, 0);
+// Release process slot
+ProcKill(0, 0);
+// DO NOT call proc_exit — just return to the caller
+```
+
+---
+
+## Phase 2 — `vpg_init()`: open an existing data directory
+
+Sequence copied from `PostgresSingleUserMain` + `PostgresMain`, with signals
+and the REPL loop removed:
+
+```c
+void vpg_init(const char *data_dir, const char *user, const char *db)
+{
+    MemoryContextInit();
+    InitializeGUCOptions();
+    SelectConfigFiles(data_dir, "vpg");
+    checkDataDir();
+    ChangeToDataDir();
+    CreateDataDirLockFile(false);
+    LocalProcessControlFile(false);
+    process_shared_preload_libraries();
+    InitializeMaxBackends();
+    InitPostmasterChildSlots();
+    InitializeFastPathLocks();
+    process_shmem_requests();
+    InitializeShmemGUCs();
+    InitializeWalConsistencyChecking();
+    CreateSharedMemoryAndSemaphores();
+    set_max_safe_fds();
+    PgStartTime = GetCurrentTimestamp();
+    InitProcess();
+    BaseInit();
+    // NO signal handlers
+    // NO sigjmp_buf loop
+    InitPostgres(db, InvalidOid, user, InvalidOid, 0, NULL);
+    SetProcessingMode(NormalProcessing);
+    BeginReportingGUCOptions();
+    // ready to execute queries
+}
+```
+
+---
+
+## Phase 3 — `vpg_exec()`: run a query
+
+No REPL loop.  One query, one PG_TRY block, result returned as string.
+
+```c
+const char *vpg_exec(const char *sql)
+{
+    PG_TRY();
+    {
+        StartTransactionCommand();
+        SPI_connect();
+        SPI_execute(sql, false, 0);
+        // format result into a malloc'd CSV/JSON string
+        result = format_spi_result();
+        SPI_finish();
+        CommitTransactionCommand();
+    }
+    PG_CATCH();
+    {
+        SPI_finish();
+        AbortCurrentTransaction();
+        vpg_last_error = CopyErrorData()->message;
+        FlushErrorState();
+        result = NULL;
+    }
+    PG_END_TRY();
+    return result;
+}
+```
+
+---
+
+## Phase 4 — `vpg_finish()`: clean shutdown
+
+```c
+void vpg_finish(void)
+{
+    RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
+    ShutdownXLOG(0, 0);
+    ProcKill(0, 0);
+    // shared memory is process-private anyway; just let it go
+}
+```
+
+---
+
+## Vlang API (vpg.v)
+
+No changes to the public API; just the internals become correct:
+
+```v
+pub fn initdb(data_dir string, user string) !      // one-time setup
+pub fn new_pg_embedded(data_dir string, user string, db string) !PGEmbedded
+pub fn (mut pg PGEmbedded) query(sql string) !string
+pub fn (mut pg PGEmbedded) close()
+```
+
+---
+
+## Files to change
+
+| File | Action |
+|------|--------|
+| `vpg_initdb.c` | **Delete** (replace with new `vpg_initdb.c` ~300 lines, no fork/pipe) |
+| `vpg_findtimezone.c` | Keep (pure timezone detection, no process model) |
+| `vpg_localtime.c` | Keep (timezone tables) |
+| `vpg_fe_shim.c` | Keep (fe/be shim, needed for initdb SQL helpers) |
+| `vpg.c` | Rewrite `vpg_initdb()`, `vpg_init()`, `vpg_exec()`, `vpg_finish()` |
+| `vpg.v` | Unchanged |
+| `Makefile` | Remove objects that are no longer needed |
+
+---
+
+## Hard constraints — never violate these
+
+- **No `fork()`** — absolutely forbidden anywhere in the codebase.
+  `fork()` is incompatible with single-process embedded use: the child
+  inherits shared-memory state (LatchWaitSet, PGPROC, shmem segments)
+  that it cannot reinitialise safely, producing crashes or corruption.
+- **No `popen()` / `pclose()`** — they fork internally.
+- **No `exec()`** — no external postgres binary.
+- **No signal-based query cancellation** — `pqsignal()` calls are removed
+  everywhere; errors are caught with `PG_TRY`/`PG_CATCH` instead.
+- **No `proc_exit()`** — control must always return to the caller.
+
+Any code that calls `fork`, `popen`, `pclose`, `exec`, `system`, or
+`proc_exit` is a bug and must be replaced.
+
+---
+
+## What we do NOT support (intentional)
+
+- Multiple concurrent connections (single connection like SQLite)
+- Postmaster / network listener
+- Signal-based query cancellation
+- External authentication (trust only)
+- Extensions that fork worker processes
+- Parallel query (requires worker processes)
+
+These constraints may be relaxed later without breaking the API, because the
+design does not bake in any assumptions that would prevent it — it just does
+not implement it yet.
+
+---
+
+## Build
+
+The build process stays the same:
+
+1. Compile PostgreSQL backend objects into `libvpg.a` (already done).
+2. Compile `vpg.c`, `vpg_initdb.c`, `vpg_findtimezone.c`, `vpg_localtime.c`,
+   `vpg_fe_shim.c` and link against `libvpg.a`.
+3. `v run cmd/vpg_test.v` compiles and runs the V test.

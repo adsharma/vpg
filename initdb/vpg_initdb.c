@@ -62,8 +62,9 @@
 #include "common/file_utils.h"
 #include "common/logging.h"
 #include "utils/memutils.h"
+#include "vpg_bootstrap.h"
+#include "vpg_setup.h"
 
-#include <sys/wait.h>
 #include <unistd.h>
 
 /* VPG: sync_pgdata declared under #ifdef FRONTEND; forward-declare for backend build */
@@ -1245,7 +1246,7 @@ write_version_file(const char *extrapath)
 	if (fprintf(version_file, "%s\n", PG_MAJORVERSION) < 0 ||
 		fclose(version_file))
 		pg_fatal("could not write file \"%s\": %m", path);
-	free(path);
+	pfree(path);
 }
 
 /*
@@ -1264,7 +1265,7 @@ set_null_conf(void)
 		pg_fatal("could not open file \"%s\" for writing: %m", path);
 	if (fclose(conf_file))
 		pg_fatal("could not write file \"%s\": %m", path);
-	free(path);
+	pfree(path);
 }
 
 /*
@@ -1626,95 +1627,32 @@ setup_config(void)
 
 /*
  * run the BKI script in bootstrap mode to create template1
+ * VPG: calls vpg_bootstrap() directly — no fork, no pipe, no signals.
  */
 static void
 bootstrap_template1(void)
 {
-	PG_CMD_DECL;
-	PQExpBufferData cmd;
-	char	  **line;
-	char	  **bki_lines;
-	char		headerline[MAXPGPATH];
-	char		buf[64];
-
 	printf(_("running bootstrap script ... "));
 	fflush(stdout);
 
-	bki_lines = readfile(bki_file);
-
-	/* Check that bki file appears to be of the right version */
-
-	snprintf(headerline, sizeof(headerline), "# PostgreSQL %s\n",
-			 PG_MAJORVERSION);
-
-	if (strcmp(headerline, *bki_lines) != 0)
-	{
-		pg_log_error("input file \"%s\" does not belong to PostgreSQL %s",
-					 bki_file, PG_VERSION);
-		pg_log_error_hint("Specify the correct path using the option -L.");
-		exit(1);
-	}
-
-	/* Substitute for various symbols used in the BKI file */
-
-	sprintf(buf, "%d", NAMEDATALEN);
-	bki_lines = replace_token(bki_lines, "NAMEDATALEN", buf);
-
-	sprintf(buf, "%d", (int) sizeof(Pointer));
-	bki_lines = replace_token(bki_lines, "SIZEOF_POINTER", buf);
-
-	bki_lines = replace_token(bki_lines, "ALIGNOF_POINTER",
-							  (sizeof(Pointer) == 4) ? "i" : "d");
-
-	bki_lines = replace_token(bki_lines, "FLOAT8PASSBYVAL",
-							  FLOAT8PASSBYVAL ? "true" : "false");
-
-	bki_lines = replace_token(bki_lines, "POSTGRES",
-							  escape_quotes_bki(username));
-
-	bki_lines = replace_token(bki_lines, "ENCODING",
-							  encodingid_to_string(encodingid));
-
-	bki_lines = replace_token(bki_lines, "LC_COLLATE",
-							  escape_quotes_bki(lc_collate));
-
-	bki_lines = replace_token(bki_lines, "LC_CTYPE",
-							  escape_quotes_bki(lc_ctype));
-
-	bki_lines = replace_token(bki_lines, "DATLOCALE",
-							  datlocale ? escape_quotes_bki(datlocale) : "_null_");
-
-	bki_lines = replace_token(bki_lines, "ICU_RULES",
-							  icu_rules ? escape_quotes_bki(icu_rules) : "_null_");
-
-	sprintf(buf, "%c", locale_provider);
-	bki_lines = replace_token(bki_lines, "LOCALE_PROVIDER", buf);
-
-	/* Also ensure backend isn't confused by this environment var: */
 	unsetenv("PGCLIENTENCODING");
 
-	initPQExpBuffer(&cmd);
-
-	printfPQExpBuffer(&cmd, "\"%s\" --boot %s %s", backend_exec, boot_options, extra_options);
-	appendPQExpBuffer(&cmd, " -X %d", wal_segment_size_mb * (1024 * 1024));
-	if (data_checksums)
-		appendPQExpBufferStr(&cmd, " -k");
-	if (debug)
-		appendPQExpBufferStr(&cmd, " -d 5");
-
-
-	PG_CMD_OPEN(cmd.data);
-
-	for (line = bki_lines; *line != NULL; line++)
+	if (vpg_bootstrap(pg_data,
+	                  bki_file,
+	                  username,
+	                  encodingid,
+	                  lc_collate,
+	                  lc_ctype,
+	                  datlocale,
+	                  icu_rules,
+	                  locale_provider,
+	                  data_checksums,
+	                  wal_segment_size_mb * 1024 * 1024,
+	                  vpg_get_exec_path()) != 0)
 	{
-		PG_CMD_PUTS(*line);
-		free(*line);
+		pg_log_error("bootstrap failed: %s", vpg_bootstrap_error());
+		exit(1);
 	}
-
-	PG_CMD_CLOSE();
-
-	termPQExpBuffer(&cmd);
-	free(bki_lines);
 
 	check_ok();
 }
@@ -3098,7 +3036,7 @@ create_xlog_or_symlink(void)
 					 subdirloc);
 	}
 
-	free(subdirloc);
+	pfree(subdirloc);
 }
 
 
@@ -3153,7 +3091,7 @@ initialize_data_directory(void)
 		if (mkdir(path, pg_dir_create_mode) < 0)
 			pg_fatal("could not create directory \"%s\": %m", path);
 
-		free(path);
+		pfree(path);
 	}
 
 	check_ok();
@@ -3177,53 +3115,23 @@ initialize_data_directory(void)
 	write_version_file("base/1");
 
 	/*
-	 * Create the stuff we don't need to use bootstrap mode for, using a
-	 * backend running in simple standalone mode.
+	 * Post-bootstrap SQL setup — VPG: no fork, uses vpg_setup() via SPI.
 	 */
 	fputs(_("performing post-bootstrap initialization ... "), stdout);
 	fflush(stdout);
 
-	initPQExpBuffer(&cmd);
-	printfPQExpBuffer(&cmd, "\"%s\" %s %s template1 >%s",
-					  backend_exec, backend_options, extra_options, DEVNULL);
-
-	PG_CMD_OPEN(cmd.data);
-
-	setup_auth(cmdfd);
-
-	setup_run_file(cmdfd, system_constraints_file);
-
-	setup_run_file(cmdfd, system_functions_file);
-
-	setup_depend(cmdfd);
-
-	/*
-	 * Note that no objects created after setup_depend() will be "pinned".
-	 * They are all droppable at the whim of the DBA.
-	 */
-
-	setup_run_file(cmdfd, system_views_file);
-
-	setup_description(cmdfd);
-
-	setup_collation(cmdfd);
-
-	setup_run_file(cmdfd, dictionary_file);
-
-	setup_privileges(cmdfd);
-
-	setup_schema(cmdfd);
-
-	load_plpgsql(cmdfd);
-
-	vacuum_db(cmdfd);
-
-	make_template0(cmdfd);
-
-	make_postgres(cmdfd);
-
-	PG_CMD_CLOSE();
-	termPQExpBuffer(&cmd);
+	if (vpg_setup(username,
+	              system_constraints_file,
+	              system_functions_file,
+	              system_views_file,
+	              dictionary_file,
+	              info_schema_file,
+	              features_file,
+	              infoversion) != 0)
+	{
+		pg_log_error("post-bootstrap setup failed: %s", vpg_setup_error());
+		exit(1);
+	}
 
 	check_ok();
 }

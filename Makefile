@@ -4,7 +4,6 @@ PGSRC  := $(PGROOT)/src
 
 CC := cc
 
-# Single set of flags — single process, single ABI, no frontend/backend split.
 CFLAGS := -g -O0 \
 	-I$(PGINST)/include/server \
 	-I$(PGINST)/include/internal \
@@ -13,7 +12,8 @@ CFLAGS := -g -O0 \
 	-I$(PGINST)/include \
 	-I$(PGROOT)/src/interfaces/libpq \
 	-I$(PGROOT)/src/timezone \
-	-I/opt/homebrew/opt/icu4c@78/include
+	-I/opt/homebrew/opt/icu4c@78/include \
+	-I.
 
 LDFLAGS := -L$(PGINST)/lib
 PG_LIBS_RAW := $(shell $(PGINST)/bin/pg_config --libs)
@@ -33,22 +33,42 @@ BACKEND_OBJS := $(filter-out \
 	$(PGROOT)/src/backend/replication/libpqwalreceiver/libpqwalreceiver.o, \
 	$(BACKEND_OBJS))
 
-VPG_OBJS    := vpg.o vpg_initdb.o vpg_findtimezone.o vpg_fe_shim.o
+FEUTILS_NEEDED := \
+	$(PGROOT)/src/fe_utils/option_utils.o
+
+# ---- initdb sub-library ------------------------------------------------
+INITDB_DIR  := initdb
+INITDB_SRCS := $(wildcard $(INITDB_DIR)/*.c)
+INITDB_OBJS := $(INITDB_SRCS:.c=.o)
+INITDB_LIB  := $(INITDB_DIR)/libvpg_initdb.a
+
+# ---- top-level core object ---------------------------------------------
+CORE_OBJS   := vpg.o
+
+# ---- combined archive --------------------------------------------------
 VPG_ARCHIVE := libvpg.a
 
 .PHONY: all clean
 
 all: $(VPG_ARCHIVE)
 
-FEUTILS_NEEDED := \
-	$(PGROOT)/src/fe_utils/option_utils.o
+# Build initdb objects (clang resolves "vpg_bootstrap.h" relative to
+# the source file's own directory, so no extra -I needed)
+$(INITDB_DIR)/%.o: $(INITDB_DIR)/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
-$(VPG_ARCHIVE): $(VPG_OBJS)
+$(INITDB_LIB): $(INITDB_OBJS)
 	rm -f $@
-	ar rcs $@ $(VPG_OBJS) $(BACKEND_OBJS) $(FEUTILS_NEEDED)
+	ar rcs $@ $(INITDB_OBJS)
 
+# Top-level vpg.o
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Pack everything into one archive the V linker sees
+$(VPG_ARCHIVE): $(CORE_OBJS) $(INITDB_LIB)
+	rm -f $@
+	ar rcs $@ $(CORE_OBJS) $(INITDB_OBJS) $(BACKEND_OBJS) $(FEUTILS_NEEDED)
+
 clean:
-	rm -f $(VPG_ARCHIVE) $(VPG_OBJS)
+	rm -f $(VPG_ARCHIVE) $(CORE_OBJS) $(INITDB_OBJS) $(INITDB_LIB)

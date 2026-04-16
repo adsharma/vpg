@@ -5,3 +5,5 @@ test_vpg
 test_vpg_bin
 *.dSYM/
 *.o
+initdb/libvpg_initdb.a
+initdb/*.o

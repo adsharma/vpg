@@ -474,19 +474,19 @@ static void set_null_conf(void);
 static void test_config_settings(void);
 static void setup_config(void);
 static void bootstrap_template1(void);
-static void setup_auth(FILE *cmdfd);
+static void setup_auth(void);
 static void get_su_pwd(void);
-static void setup_depend(FILE *cmdfd);
-static void setup_run_file(FILE *cmdfd, const char *filename);
-static void setup_description(FILE *cmdfd);
-static void setup_collation(FILE *cmdfd);
-static void setup_privileges(FILE *cmdfd);
+static void setup_depend(void);
+static void setup_run_file(const char *filename);
+static void setup_description(void);
+static void setup_collation(void);
+static void setup_privileges(void);
 static void set_info_version(void);
-static void setup_schema(FILE *cmdfd);
-static void load_plpgsql(FILE *cmdfd);
-static void vacuum_db(FILE *cmdfd);
-static void make_template0(FILE *cmdfd);
-static void make_postgres(FILE *cmdfd);
+static void setup_schema(void);
+static void load_plpgsql(void);
+static void vacuum_db(void);
+static void make_template0(void);
+static void make_postgres(void);
 static void trapsig(SIGNAL_ARGS);
 static void check_ok(void);
 static char *escape_quotes(const char *src);
@@ -509,34 +509,14 @@ void		warn_on_mount_point(int error);
 void		initialize_data_directory(void);
 
 /*
- * macros for running pipes to postgres
+ * VPG: PG_CMD_* macros rewritten to call vpg_run_sql / vpg_run_file
+ * directly — no fork, no pipe, no FILE*.
  */
-#define PG_CMD_DECL		FILE *cmdfd
-
-#define PG_CMD_OPEN(cmd) \
-do { \
-	cmdfd = popen_check(cmd, "w"); \
-	if (cmdfd == NULL) \
-		exit(1); /* message already printed by popen_check */ \
-} while (0)
-
-#define PG_CMD_CLOSE() \
-do { \
-	if (pclose_check(cmdfd)) \
-		exit(1); /* message already printed by pclose_check */ \
-} while (0)
-
-#define PG_CMD_PUTS(line) \
-do { \
-	if (fputs(line, cmdfd) < 0 || fflush(cmdfd) < 0) \
-		output_failed = true, output_errno = errno; \
-} while (0)
-
-#define PG_CMD_PRINTF(fmt, ...) \
-do { \
-	if (fprintf(cmdfd, fmt, __VA_ARGS__) < 0 || fflush(cmdfd) < 0) \
-		output_failed = true, output_errno = errno; \
-} while (0)
+#define PG_CMD_DECL		/* nothing */
+#define PG_CMD_OPEN(cmd)	((void)(cmd))
+#define PG_CMD_CLOSE()		((void)0)
+#define PG_CMD_PUTS(line)	vpg_run_sql(line)
+#define PG_CMD_PRINTF(fmt, ...) vpg_run_sql(psprintf(fmt, __VA_ARGS__))
 
 #ifdef WIN32
 typedef wchar_t *save_locale_t;
@@ -1661,7 +1641,7 @@ bootstrap_template1(void)
  * set up the shadow password table
  */
 static void
-setup_auth(FILE *cmdfd)
+setup_auth(void)
 {
 	/*
 	 * The authid table shouldn't be readable except through views, to ensure
@@ -1737,7 +1717,7 @@ get_su_pwd(void)
  * set up pg_depend
  */
 static void
-setup_depend(FILE *cmdfd)
+setup_depend(void)
 {
 	/*
 	 * Advance the OID counter so that subsequently-created objects aren't
@@ -1750,28 +1730,16 @@ setup_depend(FILE *cmdfd)
  * Run external file
  */
 static void
-setup_run_file(FILE *cmdfd, const char *filename)
+setup_run_file(const char *filename)
 {
-	char	  **lines;
-
-	lines = readfile(filename);
-
-	for (char **line = lines; *line != NULL; line++)
-	{
-		PG_CMD_PUTS(*line);
-		free(*line);
-	}
-
-	PG_CMD_PUTS("\n\n");
-
-	free(lines);
+	vpg_run_file(filename);
 }
 
 /*
  * fill in extra description data
  */
 static void
-setup_description(FILE *cmdfd)
+setup_description(void)
 {
 	/* Create default descriptions for operator implementation functions */
 	PG_CMD_PUTS("WITH funcdescs AS ( "
@@ -1792,7 +1760,7 @@ setup_description(FILE *cmdfd)
  * populate pg_collation
  */
 static void
-setup_collation(FILE *cmdfd)
+setup_collation(void)
 {
 	/*
 	 * Set the collation version for collations defined in pg_collation.dat,
@@ -1825,7 +1793,7 @@ setup_collation(FILE *cmdfd)
  * we don't include databases or tablespaces.
  */
 static void
-setup_privileges(FILE *cmdfd)
+setup_privileges(void)
 {
 	PG_CMD_PRINTF("UPDATE pg_class "
 				  "  SET relacl = (SELECT array_agg(a.acl) FROM "
@@ -1993,9 +1961,9 @@ set_info_version(void)
  * load info schema and populate from features file
  */
 static void
-setup_schema(FILE *cmdfd)
+setup_schema(void)
 {
-	setup_run_file(cmdfd, info_schema_file);
+	setup_run_file(info_schema_file);
 
 	PG_CMD_PRINTF("UPDATE information_schema.sql_implementation_info "
 				  "  SET character_value = '%s' "
@@ -2013,7 +1981,7 @@ setup_schema(FILE *cmdfd)
  * load PL/pgSQL server-side language
  */
 static void
-load_plpgsql(FILE *cmdfd)
+load_plpgsql(void)
 {
 	PG_CMD_PUTS("CREATE EXTENSION plpgsql;\n\n");
 }
@@ -2022,17 +1990,20 @@ load_plpgsql(FILE *cmdfd)
  * clean everything up in template1
  */
 static void
-vacuum_db(FILE *cmdfd)
+vacuum_db(void)
 {
-	/* Run analyze before VACUUM so the statistics are frozen. */
-	PG_CMD_PUTS("ANALYZE;\n\nVACUUM FREEZE;\n\n");
+	/*
+	 * In SPI mode VACUUM is rejected ("cannot be executed from a function").
+	 * Keep ANALYZE and skip VACUUM for now.
+	 */
+	PG_CMD_PUTS("ANALYZE;\n\n");
 }
 
 /*
  * copy template1 to template0
  */
 static void
-make_template0(FILE *cmdfd)
+make_template0(void)
 {
 	/*
 	 * pg_upgrade tries to preserve database OIDs across upgrades. It's smart
@@ -2077,16 +2048,15 @@ make_template0(FILE *cmdfd)
 	PG_CMD_PUTS("COMMENT ON DATABASE template0 IS 'unmodifiable empty database';\n\n");
 
 	/*
-	 * Finally vacuum to clean up dead rows in pg_database
+	 * SPI mode cannot execute VACUUM (top-level utility only), so skip this.
 	 */
-	PG_CMD_PUTS("VACUUM pg_database;\n\n");
 }
 
 /*
  * copy template1 to postgres
  */
 static void
-make_postgres(FILE *cmdfd)
+make_postgres(void)
 {
 	/*
 	 * Just as we did for template0, and for the same reasons, assign a fixed
@@ -3136,6 +3106,51 @@ initialize_data_directory(void)
 	check_ok();
 }
 
+/*
+ * vpg_post_bootstrap_sql — called by vpg_setup() after the relcache and
+ * search path are ready.  Runs all post-bootstrap SQL in sequence using
+ * the existing (now FILE*-free) setup_* functions.
+ */
+void
+vpg_post_bootstrap_sql(const char *p_username,
+                       const char *p_system_constraints_file,
+                       const char *p_system_functions_file,
+                       const char *p_system_views_file,
+                       const char *p_dictionary_file,
+                       const char *p_info_schema_file,
+                       const char *p_features_file,
+                       const char *p_infoversion)
+{
+	/*
+	 * The setup_* functions reference module-level globals (username,
+	 * system_constraints_file, etc.).  Assign the caller's values into
+	 * those globals now.
+	 */
+	username                = (char *) p_username;
+	system_constraints_file = (char *) p_system_constraints_file;
+	system_functions_file   = (char *) p_system_functions_file;
+	system_views_file       = (char *) p_system_views_file;
+	dictionary_file         = (char *) p_dictionary_file;
+	info_schema_file        = (char *) p_info_schema_file;
+	features_file           = (char *) p_features_file;
+	if (p_infoversion != infoversion)
+		strlcpy(infoversion, p_infoversion, sizeof(infoversion));
+
+	setup_auth();
+	setup_run_file(system_constraints_file);
+	setup_run_file(system_functions_file);
+	setup_depend();
+	setup_run_file(system_views_file);
+	setup_description();
+	setup_collation();
+	setup_run_file(dictionary_file);
+	setup_privileges();
+	setup_schema();
+	load_plpgsql();
+	vacuum_db();
+	make_template0();
+	make_postgres();
+}
 
 int
 vpg_initdb_run(int argc, char *argv[])

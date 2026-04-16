@@ -3,17 +3,17 @@
  *
  * Post-bootstrap SQL initialisation — no fork, no pipe, no signals.
  *
- * Called immediately after vpg_bootstrap() returns, while still in the same
- * process.  At entry shared memory is live, MyProc is registered, and
- * InitPostgres() has already run in bootstrap mode.  All we do is:
+ * After vpg_bootstrap() returns the process is still live with shared
+ * memory and a PGPROC entry, but InitPostgres ran in bootstrap mode and
+ * skipped shared-catalog relcache setup, the search path, and ACL init.
+ * This file:
  *
- *   1. Switch to NormalProcessing so the executor / SPI work.
- *   2. Run each SQL block that initdb's "--single" pass used to pipe into
- *      a forked backend.
- *   3. Return.  No teardown here — the caller (vpg_initdb_run) handles that.
- *
- * Errors are caught with PG_TRY and returned as -1; call
- * vpg_setup_error() for the message.
+ *   1. Switches to NormalProcessing.
+ *   2. Re-runs RelationCacheInitializePhase2/3 (bootstrap skipped phase2
+ *      for shared catalogs such as pg_authid).
+ *   3. Initialises the search path and client encoding inside a transaction.
+ *   4. Delegates to vpg_post_bootstrap_sql() (in vpg_initdb.c) which calls
+ *      the already-correct setup_*() functions via vpg_run_sql/vpg_run_file.
  */
 
 #include "postgres.h"
@@ -22,19 +22,30 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "access/session.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
-#include "catalog/pg_collation.h"
+#include "catalog/pg_database.h"
 #include "executor/spi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/pg_list.h"
+#include "parser/analyze.h"
+#include "tcop/tcopprot.h"
+#include "tcop/utility.h"
+#include "utils/builtins.h"
 #include "utils/elog.h"
+#include "utils/guc.h"
+#include "utils/pg_locale.h"
 #include "utils/relcache.h"
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
+
+#include "vpg_setup.h"
 
 /* ----------------------------------------------------------------
- * Internal helpers
+ * Error state
  * ---------------------------------------------------------------- */
 
 static char vpg_setup_errbuf[1024];
@@ -45,40 +56,102 @@ vpg_setup_error(void)
     return vpg_setup_errbuf;
 }
 
-/*
- * Execute a single SQL string inside its own transaction.
- * Errors propagate as PG exceptions — the caller's PG_TRY catches them.
- */
+/* ----------------------------------------------------------------
+ * vpg_run_sql / vpg_run_file  (used by setup_* in vpg_initdb.c)
+ * ---------------------------------------------------------------- */
+
+static bool
+sql_starts_with(const char *sql, const char *kw)
+{
+    while (*sql == ' ' || *sql == '\n' || *sql == '\r' || *sql == '\t')
+        sql++;
+    return pg_strncasecmp(sql, kw, strlen(kw)) == 0;
+}
+
 static void
-run_sql(const char *sql)
+vpg_run_utility_toplevel(const char *sql)
+{
+    List       *raw_parsetree_list;
+    ListCell   *lc;
+
+    raw_parsetree_list = pg_parse_query(sql);
+
+    foreach(lc, raw_parsetree_list)
+    {
+        RawStmt    *parsetree = lfirst_node(RawStmt, lc);
+        List       *stmt_list;
+        ListCell   *lc2;
+
+        stmt_list = pg_analyze_and_rewrite_fixedparams(parsetree, sql,
+                                                       NULL, 0, NULL);
+        stmt_list = pg_plan_queries(stmt_list, sql,
+                                    CURSOR_OPT_PARALLEL_OK, NULL);
+
+        foreach(lc2, stmt_list)
+        {
+            PlannedStmt *stmt = lfirst_node(PlannedStmt, lc2);
+            QueryCompletion qc;
+
+            if (stmt->utilityStmt == NULL)
+                ereport(ERROR,
+                        (errmsg("expected utility statement, got DML: %.120s", sql)));
+
+            CommandCounterIncrement();
+            PushActiveSnapshot(GetTransactionSnapshot());
+            ProcessUtility(stmt,
+                           sql,
+                           false,
+                           PROCESS_UTILITY_TOPLEVEL,
+                           NULL,
+                           NULL,
+                           None_Receiver,
+                           &qc);
+            PopActiveSnapshot();
+        }
+    }
+}
+
+void
+vpg_run_sql(const char *sql)
 {
     int rc;
 
     StartTransactionCommand();
     PushActiveSnapshot(GetTransactionSnapshot());
 
-    rc = SPI_connect();
-    if (rc != SPI_OK_CONNECT)
-        ereport(ERROR,
-                (errmsg("SPI_connect failed: %s",
-                        SPI_result_code_string(rc))));
+    if (sql_starts_with(sql, "VACUUM") ||
+        sql_starts_with(sql, "CREATE DATABASE"))
+    {
+        /*
+         * Top-level utility commands are rejected in SPI context with
+         * "cannot be executed from a function". Route them through
+         * ProcessUtility as PROCESS_UTILITY_TOPLEVEL.
+         */
+        vpg_run_utility_toplevel(sql);
+    }
+    else
+    {
+        rc = SPI_connect();
+        if (rc != SPI_OK_CONNECT)
+            ereport(ERROR,
+                    (errmsg("SPI_connect failed: %s",
+                            SPI_result_code_string(rc))));
 
-    rc = SPI_exec(sql, 0);
-    if (rc < 0)
-        ereport(ERROR,
-                (errmsg("SPI_exec failed (%s) for: %.120s",
-                        SPI_result_code_string(rc), sql)));
+        rc = SPI_exec(sql, 0);
+        if (rc < 0)
+            ereport(ERROR,
+                    (errmsg("SPI_exec failed (%s) for: %.200s",
+                            SPI_result_code_string(rc), sql)));
 
-    SPI_finish();
+        SPI_finish();
+    }
+
     PopActiveSnapshot();
     CommitTransactionCommand();
 }
 
-/*
- * Read a SQL file and execute it as one block.
- */
-static void
-run_file(const char *path)
+void
+vpg_run_file(const char *path)
 {
     FILE   *f;
     long    len;
@@ -103,8 +176,53 @@ run_file(const char *path)
     buf[len] = '\0';
     fclose(f);
 
-    run_sql(buf);
+    vpg_run_sql(buf);
     pfree(buf);
+}
+
+/*
+ * Bootstrap-mode InitPostgres() skips CheckMyDatabase(), which normally sets
+ * encoding + locale/collation state used by regex and other locale-sensitive
+ * operators.  Recreate the essential parts here.
+ */
+static void
+vpg_setup_database_locale_state(void)
+{
+    HeapTuple tup;
+    Form_pg_database dbform;
+    Datum datum;
+    char *collate;
+    char *ctype;
+
+    tup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+    if (!HeapTupleIsValid(tup))
+        elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
+
+    dbform = (Form_pg_database) GETSTRUCT(tup);
+
+    SetDatabaseEncoding(dbform->encoding);
+    SetConfigOption("server_encoding", GetDatabaseEncodingName(),
+                    PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
+    SetConfigOption("client_encoding", GetDatabaseEncodingName(),
+                    PGC_BACKEND, PGC_S_DYNAMIC_DEFAULT);
+
+    datum = SysCacheGetAttrNotNull(DATABASEOID, tup, Anum_pg_database_datcollate);
+    collate = TextDatumGetCString(datum);
+    datum = SysCacheGetAttrNotNull(DATABASEOID, tup, Anum_pg_database_datctype);
+    ctype = TextDatumGetCString(datum);
+
+    if (pg_perm_setlocale(LC_COLLATE, collate) == NULL)
+        ereport(ERROR,
+                (errmsg("database locale LC_COLLATE \"%s\" not recognized", collate)));
+
+    if (pg_perm_setlocale(LC_CTYPE, ctype) == NULL)
+        ereport(ERROR,
+                (errmsg("database locale LC_CTYPE \"%s\" not recognized", ctype)));
+
+    database_ctype_is_c = (strcmp(ctype, "C") == 0 || strcmp(ctype, "POSIX") == 0);
+    init_database_collation();
+
+    ReleaseSysCache(tup);
 }
 
 /* ----------------------------------------------------------------
@@ -124,184 +242,44 @@ vpg_setup(const char *username,
     int rc = 0;
 
     /*
-     * We are still in the same process as vpg_bootstrap().
-     * Shared memory is live.  Switch to normal processing so the
-     * executor, SPI, and catalog lookups all work correctly.
+     * Switch from BootstrapProcessing to NormalProcessing so the executor,
+     * SPI, and catalog name lookups all work correctly.
      */
     SetProcessingMode(NormalProcessing);
     IgnoreSystemIndexes = false;
     allowSystemTableMods = true;   /* initdb needs to modify system catalogs */
 
-    SetProcessingMode(NormalProcessing);
-    IgnoreSystemIndexes = false;
-    allowSystemTableMods = true;   /* initdb needs to modify system catalogs */
-
     /*
-     * RelationCacheInitializePhase2() skipped shared catalogs during
-     * bootstrap (it has an early-return for IsBootstrapProcessingMode).
-     * Now that we're in NormalProcessing, run both phases so pg_authid
-     * and other shared catalogs are nailed into the relcache properly.
+     * RelationCacheInitializePhase2() has an early return in bootstrap mode,
+     * so shared catalogs (pg_authid, pg_database, ...) were never nailed.
+     * Re-run both phases now that we are in NormalProcessing.
      */
     RelationMapInitializePhase2();
     RelationCacheInitializePhase2();
 
     PG_TRY();
     {
-        char *sql;
-
         /*
-         * Phase3 and search-path setup need an active transaction.
+         * Phase3 and search-path initialisation need an active transaction
+         * because they read pg_namespace / pg_database.
          */
         StartTransactionCommand();
         RelationCacheInitializePhase3();
+        vpg_setup_database_locale_state();
         InitializeSearchPath();
         InitializeClientEncoding();
+        InitializeSession();
         CommitTransactionCommand();
 
-        /* setup_auth: revoke public access to pg_authid */
-        run_sql("REVOKE ALL ON pg_authid FROM public;");
-
-        run_file(system_constraints_file);
-
-        run_file(system_functions_file);
-
-        /* setup_depend: stop pinning newly-created objects */
-        run_sql("SELECT pg_stop_making_pinned_objects();");
-
-        run_file(system_views_file);
-
-        run_sql(
-            "WITH funcdescs AS ("
-            "  SELECT p.oid AS p_oid, o.oid AS o_oid, oprname"
-            "  FROM pg_proc p JOIN pg_operator o ON oprcode = p.oid)"
-            "INSERT INTO pg_description"
-            "  SELECT p_oid, 'pg_proc'::regclass, 0,"
-            "    'implementation of ' || oprname || ' operator'"
-            "  FROM funcdescs"
-            "  WHERE NOT EXISTS ("
-            "    SELECT 1 FROM pg_description"
-            "    WHERE objoid = p_oid AND classoid = 'pg_proc'::regclass)"
-            "  AND NOT EXISTS ("
-            "    SELECT 1 FROM pg_description"
-            "    WHERE objoid = o_oid AND classoid = 'pg_operator'::regclass"
-            "    AND description LIKE 'deprecated%');");
-
-        run_sql("UPDATE pg_collation"
-                "  SET collversion = pg_collation_actual_version(oid)"
-                "  WHERE collname = 'unicode';");
-        run_sql("SELECT pg_import_system_collations('pg_catalog');");
-
-        run_file(dictionary_file);
-
-        run_sql(
-            "UPDATE pg_class"
-            "  SET relacl = (SELECT array_agg(a.acl) FROM"
-            "    (SELECT E'=r/\"' || current_user || E'\"' AS acl"
-            "    UNION SELECT unnest(relacl)) a)"
-            "  WHERE relkind IN ('r','v','m','S','f','p')"
-            "  AND relacl IS NOT NULL"
-            "  AND pg_catalog.array_position(relacl,"
-            "       (E'=r/\"' || current_user || E'\"')::aclitem) IS NULL;");
-        run_sql("GRANT USAGE ON SCHEMA pg_catalog, public TO PUBLIC;");
-        run_sql("REVOKE ALL ON pg_largeobject FROM PUBLIC;");
-
-        /* pg_init_privs rows for the above grants */
-        run_sql(
-            "INSERT INTO pg_init_privs"
-            "  (objoid, classoid, objsubid, initprivs)"
-            "  SELECT oid, 'pg_class'::regclass, 0, relacl"
-            "  FROM pg_class"
-            "  WHERE relacl IS NOT NULL"
-            "  AND relkind IN ('r','v','m','S','f','p');");
-        run_sql(
-            "INSERT INTO pg_init_privs"
-            "  (objoid, classoid, objsubid, initprivs)"
-            "  SELECT pg_class.oid, 'pg_class'::regclass, pg_attribute.attnum,"
-            "    pg_attribute.attacl"
-            "  FROM pg_class JOIN pg_attribute ON pg_class.oid = attrelid"
-            "  WHERE pg_attribute.attacl IS NOT NULL"
-            "  AND pg_class.relkind IN ('r','v','m','S','f','p');");
-        run_sql(
-            "INSERT INTO pg_init_privs"
-            "  (objoid, classoid, objsubid, initprivs)"
-            "  SELECT oid, 'pg_proc'::regclass, 0, proacl"
-            "  FROM pg_proc WHERE proacl IS NOT NULL;");
-        run_sql(
-            "INSERT INTO pg_init_privs"
-            "  (objoid, classoid, objsubid, initprivs)"
-            "  SELECT oid, 'pg_type'::regclass, 0, typacl"
-            "  FROM pg_type WHERE typacl IS NOT NULL;");
-        run_sql(
-            "INSERT INTO pg_init_privs"
-            "  (objoid, classoid, objsubid, initprivs)"
-            "  SELECT oid, 'pg_language'::regclass, 0, lanacl"
-            "  FROM pg_language WHERE lanacl IS NOT NULL;");
-        run_sql(
-            "INSERT INTO pg_init_privs"
-            "  (objoid, classoid, objsubid, initprivs)"
-            "  SELECT oid, 'pg_largeobject_metadata'::regclass, 0, lomacl"
-            "  FROM pg_largeobject_metadata WHERE lomacl IS NOT NULL;");
-        run_sql(
-            "INSERT INTO pg_init_privs"
-            "  (objoid, classoid, objsubid, initprivs)"
-            "  SELECT oid, 'pg_namespace'::regclass, 0, nspacl"
-            "  FROM pg_namespace WHERE nspacl IS NOT NULL;");
-        run_sql(
-            "INSERT INTO pg_init_privs"
-            "  (objoid, classoid, objsubid, initprivs)"
-            "  SELECT oid, 'pg_foreign_data_wrapper'::regclass, 0, fdwacl"
-            "  FROM pg_foreign_data_wrapper WHERE fdwacl IS NOT NULL;");
-        run_sql(
-            "INSERT INTO pg_init_privs"
-            "  (objoid, classoid, objsubid, initprivs)"
-            "  SELECT oid, 'pg_foreign_server'::regclass, 0, srvacl"
-            "  FROM pg_foreign_server WHERE srvacl IS NOT NULL;");
-
-        run_file(info_schema_file);
-
-        sql = psprintf(
-            "UPDATE information_schema.sql_implementation_info"
-            "  SET character_value = '%s'"
-            "  WHERE implementation_info_name = 'DBMS VERSION';",
-            infoversion);
-        run_sql(sql);
-        pfree(sql);
-
-        sql = psprintf(
-            "COPY information_schema.sql_features"
-            "  (feature_id, feature_name, sub_feature_id,"
-            "   sub_feature_name, is_supported, comments)"
-            "  FROM E'%s';",
-            features_file);
-        run_sql(sql);
-        pfree(sql);
-
-        run_sql("CREATE EXTENSION plpgsql;");
-
-        run_sql("ANALYZE;");
-        run_sql("VACUUM FREEZE;");
-
-        run_sql(
-            "CREATE DATABASE template0"
-            "  IS_TEMPLATE = true ALLOW_CONNECTIONS = false"
-            "  OID = 4 STRATEGY = file_copy;");
-        run_sql("UPDATE pg_database SET datcollversion = NULL"
-                "  WHERE datname = 'template0';");
-        run_sql("UPDATE pg_database"
-                "  SET datcollversion ="
-                "    pg_database_collation_actual_version(oid)"
-                "  WHERE datname = 'template1';");
-        run_sql("REVOKE CREATE,TEMPORARY ON DATABASE template1 FROM public;");
-        run_sql("REVOKE CREATE,TEMPORARY ON DATABASE template0 FROM public;");
-        run_sql("COMMENT ON DATABASE template0 IS 'unmodifiable empty database';");
-        run_sql("VACUUM pg_database;");
-
-        run_sql(
-            "CREATE DATABASE postgres"
-            "  OID = 5 STRATEGY = file_copy;");
-        run_sql("COMMENT ON DATABASE postgres IS"
-                "  'default administrative connection database';");
-
+        /* Run all post-bootstrap SQL via the setup_* functions in vpg_initdb.c */
+        vpg_post_bootstrap_sql(username,
+                               system_constraints_file,
+                               system_functions_file,
+                               system_views_file,
+                               dictionary_file,
+                               info_schema_file,
+                               features_file,
+                               infoversion);
     }
     PG_CATCH();
     {
@@ -309,7 +287,6 @@ vpg_setup(const char *username,
         snprintf(vpg_setup_errbuf, sizeof(vpg_setup_errbuf),
                  "%s", edata->message ? edata->message : "unknown setup error");
         FlushErrorState();
-        /* Do NOT call FreeErrorData here — memory context may be gone */
         rc = -1;
     }
     PG_END_TRY();

@@ -18,6 +18,9 @@ def main() -> None:
             print(result, end="")
             assert "1,Ada" in result
             assert "2,Grace" in result
+            pg.vacuum()
+            pg.analyze()
+            pg.maintain()
 
 
 if __name__ == "__main__":

@@ -10,11 +10,15 @@
 
 #include "postgres.h"
 
+#include "access/xlog.h"
 #include "access/xact.h"
+#include "commands/vacuum.h"
 #include "executor/spi.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
+#include "postmaster/bgwriter.h"
 #include "postmaster/postmaster.h"
+#include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
@@ -209,7 +213,10 @@ vpg_initdb_options(const char *data_dir,
 	if (rc != 0)
 		vpg_replace_owned_string(&vpg_last_error, "vpg_initdb failed");
 	else
+	{
+		pqsignal(SIGUSR1, procsignal_sigusr1_handler);
 		vpg_initialized = true;
+	}
 }
 
 void
@@ -376,6 +383,113 @@ vpg_exec(const char *query)
 
 	pfree(buf.data);
 	return result;
+}
+
+static int
+vpg_run_vacuum(bits32 options)
+{
+	int			rc = 0;
+
+	if (!vpg_initialized)
+	{
+		vpg_replace_owned_string(&vpg_last_error, "backend not initialized");
+		return -1;
+	}
+
+	vpg_replace_owned_string(&vpg_last_error, NULL);
+
+	PG_TRY();
+	{
+		VacuumParams params;
+		BufferAccessStrategy bstrategy = NULL;
+		MemoryContext vac_context;
+		MemoryContext old_context;
+
+		memset(&params, 0, sizeof(params));
+		params.options = options;
+		params.freeze_min_age = -1;
+		params.freeze_table_age = -1;
+		params.multixact_freeze_min_age = -1;
+		params.multixact_freeze_table_age = -1;
+		params.log_min_duration = -1;
+		params.index_cleanup = VACOPTVALUE_UNSPECIFIED;
+		params.truncate = VACOPTVALUE_UNSPECIFIED;
+		params.toast_parent = InvalidOid;
+		params.max_eager_freeze_failure_rate = vacuum_max_eager_freeze_failure_rate;
+		params.nworkers = 0;
+
+		StartTransactionCommand();
+
+		vac_context = AllocSetContextCreate(PortalContext,
+											"vpg vacuum",
+											ALLOCSET_DEFAULT_SIZES);
+		old_context = MemoryContextSwitchTo(vac_context);
+		bstrategy = GetAccessStrategyWithSize(BAS_VACUUM, VacuumBufferUsageLimit);
+		MemoryContextSwitchTo(old_context);
+
+		vacuum(NIL, &params, bstrategy, vac_context, true);
+		MemoryContextDelete(vac_context);
+
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		vpg_capture_current_error();
+		HOLD_INTERRUPTS();
+		AbortCurrentTransaction();
+		RESUME_INTERRUPTS();
+		rc = -1;
+	}
+	PG_END_TRY();
+
+	return rc;
+}
+
+int
+vpg_vacuum(void)
+{
+	return vpg_run_vacuum(VACOPT_VACUUM |
+						  VACOPT_PROCESS_MAIN |
+						  VACOPT_PROCESS_TOAST);
+}
+
+int
+vpg_analyze(void)
+{
+	return vpg_run_vacuum(VACOPT_ANALYZE |
+						  VACOPT_PROCESS_MAIN |
+						  VACOPT_PROCESS_TOAST);
+}
+
+int
+vpg_maintain(void)
+{
+	int rc = 0;
+
+	if (vpg_run_vacuum(VACOPT_VACUUM |
+					   VACOPT_ANALYZE |
+					   VACOPT_PROCESS_MAIN |
+					   VACOPT_PROCESS_TOAST) != 0)
+		return -1;
+
+	PG_TRY();
+	{
+		StartTransactionCommand();
+		/* Force dirty buffers and WAL state to disk before returning. */
+		RequestCheckpoint(CHECKPOINT_IMMEDIATE |
+						  CHECKPOINT_FORCE |
+						  CHECKPOINT_WAIT);
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		vpg_capture_current_error();
+		AbortCurrentTransaction();
+		rc = -1;
+	}
+	PG_END_TRY();
+
+	return rc;
 }
 
 void

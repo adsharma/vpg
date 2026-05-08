@@ -13,6 +13,9 @@ void vpg_py_set_exec_path(char * path);
 void * vpg_py_open(char * data_dir, char * user, char * db);
 int vpg_py_initdb(char * data_dir, char * user);
 char * vpg_py_query(void * handle, char * query);
+int vpg_py_vacuum(void * handle);
+int vpg_py_analyze(void * handle);
+int vpg_py_maintain(void * handle);
 void vpg_py_close(void * handle);
 char * vpg_py_last_error(void);
 void vpg_py_free(void * ptr);
@@ -81,6 +84,18 @@ class EmbeddedPostgres:
             return ffi.string(result).decode("utf-8")
         finally:
             lib.vpg_py_free(result)
+
+    def vacuum(self) -> None:
+        if lib.vpg_py_vacuum(self._handle) != 0:
+            raise VPGError(_last_error())
+
+    def analyze(self) -> None:
+        if lib.vpg_py_analyze(self._handle) != 0:
+            raise VPGError(_last_error())
+
+    def maintain(self) -> None:
+        if lib.vpg_py_maintain(self._handle) != 0:
+            raise VPGError(_last_error())
 
     def close(self) -> None:
         if self._handle != ffi.NULL:

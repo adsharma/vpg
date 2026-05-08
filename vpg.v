@@ -30,6 +30,9 @@ fn C.vpg_set_exec_path(path &char)
 fn C.vpg_set_python_error(message &char)
 fn C.vpg_python_error() &char
 fn C.vpg_exec(query &char) &char
+fn C.vpg_vacuum() int
+fn C.vpg_analyze() int
+fn C.vpg_maintain() int
 fn C.vpg_last_error_message() &char
 fn C.vpg_finish()
 fn C.vpg_free(ptr voidptr)
@@ -153,6 +156,33 @@ pub fn (mut pg PGEmbedded) query(query_text string) !string {
 	return unsafe { cstring_to_vstring(c_result) }
 }
 
+pub fn (mut pg PGEmbedded) vacuum() ! {
+	if !pg.initialized {
+		return error('PG not initialized')
+	}
+	if C.vpg_vacuum() != 0 {
+		return error(c_error_string())
+	}
+}
+
+pub fn (mut pg PGEmbedded) analyze() ! {
+	if !pg.initialized {
+		return error('PG not initialized')
+	}
+	if C.vpg_analyze() != 0 {
+		return error(c_error_string())
+	}
+}
+
+pub fn (mut pg PGEmbedded) maintain() ! {
+	if !pg.initialized {
+		return error('PG not initialized')
+	}
+	if C.vpg_maintain() != 0 {
+		return error(c_error_string())
+	}
+}
+
 pub fn (mut pg PGEmbedded) close() {
 	if !pg.initialized {
 		return
@@ -236,6 +266,39 @@ pub fn py_query(handle voidptr, query &char) &char {
 		return 0
 	}
 	return c_result
+}
+
+fn py_maintenance(handle voidptr, action fn () int) int {
+	if handle == 0 {
+		C.vpg_set_python_error(c'PG handle is null')
+		return -1
+	}
+	rc := action()
+	if rc != 0 {
+		msg := C.vpg_last_error_message()
+		if msg != 0 {
+			C.vpg_set_python_error(msg)
+		}
+	}
+	return rc
+}
+
+@[export: 'vpg_py_vacuum']
+@[py_export]
+pub fn py_vacuum(handle voidptr) int {
+	return py_maintenance(handle, C.vpg_vacuum)
+}
+
+@[export: 'vpg_py_analyze']
+@[py_export]
+pub fn py_analyze(handle voidptr) int {
+	return py_maintenance(handle, C.vpg_analyze)
+}
+
+@[export: 'vpg_py_maintain']
+@[py_export]
+pub fn py_maintain(handle voidptr) int {
+	return py_maintenance(handle, C.vpg_maintain)
 }
 
 @[export: 'vpg_py_close']

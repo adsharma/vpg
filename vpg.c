@@ -117,6 +117,15 @@ vpg_get_exec_path(void)
 #endif
 }
 
+void
+vpg_set_exec_path(const char *path)
+{
+	if (path == NULL || path[0] == '\0')
+		return;
+
+	vpg_replace_owned_string(&vpg_exec_path, path);
+}
+
 static void
 vpg_runtime_init(void)
 {
@@ -145,23 +154,39 @@ vpg_last_error_message(void)
 extern int vpg_initdb_run(int argc, char *argv[]);  /* from vpg_initdb.c */
 
 void
-vpg_initdb(const char *data_dir, const char *username)
+vpg_initdb_options(const char *data_dir,
+				   const char *username,
+				   const char *auth,
+				   const char *encoding,
+				   const char *locale,
+				   bool no_instructions)
 {
 	char *av[16];
+	char  auth_arg[128];
+	char  encoding_arg[128];
+	char  locale_arg[128];
 	int   ac = 0;
 
 	vpg_replace_owned_string(&vpg_last_error, NULL);
 	vpg_runtime_init();   /* ensure MemoryContextInit before any palloc */
+
+	snprintf(auth_arg, sizeof(auth_arg), "--auth=%s",
+			 auth != NULL && auth[0] != '\0' ? auth : "trust");
+	snprintf(encoding_arg, sizeof(encoding_arg), "--encoding=%s",
+			 encoding != NULL && encoding[0] != '\0' ? encoding : "UTF8");
+	snprintf(locale_arg, sizeof(locale_arg), "--locale=%s",
+			 locale != NULL && locale[0] != '\0' ? locale : "C");
 
 	av[ac++] = (char *) vpg_get_exec_path();
 	av[ac++] = "-D";
 	av[ac++] = (char *) data_dir;
 	av[ac++] = "-U";
 	av[ac++] = (char *) username;
-	av[ac++] = "--auth=trust";
-	av[ac++] = "--encoding=UTF8";
-	av[ac++] = "--locale=C";
-	av[ac++] = "--no-instructions";
+	av[ac++] = auth_arg;
+	av[ac++] = encoding_arg;
+	av[ac++] = locale_arg;
+	if (no_instructions)
+		av[ac++] = "--no-instructions";
 	av[ac]   = NULL;
 
 	int rc = vpg_initdb_run(ac, av);
@@ -169,6 +194,12 @@ vpg_initdb(const char *data_dir, const char *username)
 		vpg_replace_owned_string(&vpg_last_error, "vpg_initdb failed");
 	else
 		vpg_initialized = true;
+}
+
+void
+vpg_initdb(const char *data_dir, const char *username)
+{
+	vpg_initdb_options(data_dir, username, "trust", "UTF8", "C", true);
 }
 
 void

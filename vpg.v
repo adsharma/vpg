@@ -11,6 +11,7 @@ module vpg
 #flag -L @VMODROOT/postgresql/src/interfaces/libpq
 #flag -L @VMODROOT/postgresql/installed/lib
 #flag -L /opt/homebrew/opt/icu4c@78/lib
+#flag linux -rdynamic
 #flag @VMODROOT/libvpg.a
 #flag @VMODROOT/postgresql/src/common/libpgcommon_srv.a
 #flag @VMODROOT/postgresql/src/port/libpgport_srv.a

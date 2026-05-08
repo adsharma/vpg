@@ -3,7 +3,7 @@ module main
 import vpg
 import os
 
-const test_data_dir = '/private/tmp/vpg_test_data'
+const test_data_dir = '/tmp/vpg_test_data'
 
 fn testsuite_begin() ! {
 	os.rmdir_all(test_data_dir) or {}

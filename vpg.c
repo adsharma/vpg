@@ -4,7 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef __APPLE__
 #include <mach-o/dyld.h>
+#endif
 
 #include "postgres.h"
 
@@ -77,10 +79,11 @@ vpg_strdup_result(const char *value)
 const char *
 vpg_get_exec_path(void)
 {
-	uint32_t size = 0;
-
 	if (vpg_exec_path != NULL)
 		return vpg_exec_path;
+
+#ifdef __APPLE__
+	uint32_t size = 0;
 
 	_NSGetExecutablePath(NULL, &size);
 	vpg_exec_path = malloc(size);
@@ -95,6 +98,23 @@ vpg_get_exec_path(void)
 	}
 
 	return vpg_exec_path;
+#else
+	{
+		char path[1024];
+		ssize_t len;
+
+		len = readlink("/proc/self/exe", path, sizeof(path) - 1);
+		if (len < 0)
+			return "vpg";
+
+		path[len] = '\0';
+		vpg_exec_path = strdup(path);
+		if (vpg_exec_path == NULL)
+			return "vpg";
+
+		return vpg_exec_path;
+	}
+#endif
 }
 
 static void

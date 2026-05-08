@@ -66,6 +66,7 @@
 #include "vpg_setup.h"
 
 #include <unistd.h>
+#include <sys/wait.h>
 
 /* VPG: sync_pgdata declared under #ifdef FRONTEND; forward-declare for backend build */
 extern void sync_pgdata(const char *pg_data, int serverVersion,

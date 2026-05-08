@@ -23,8 +23,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/adsharma/vpg"
-Repository = "https://github.com/adsharma/vpg"
+Homepage = "https://github.com/Ladybug-Memory/vpg"
+Repository = "https://github.com/Ladybug-Memory/vpg"
 
 [tool.setuptools]
 packages = ["vpg"]

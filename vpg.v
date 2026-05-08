@@ -23,9 +23,8 @@ import os
 #flag -lz
 #flag -lm
 
-fn C.vpg_initdb(data_dir &char, username &char)
 fn C.vpg_initdb_options(data_dir &char, username &char, auth &char, encoding &char, locale &char, no_instructions bool)
-fn C.vpg_init(data_dir &char, username &char, dbname &char)
+fn C.vpg_backend_start_options(data_dir &char, username &char, dbname &char, shared_preload_libraries &char)
 fn C.vpg_set_exec_path(path &char)
 fn C.vpg_exec(query &char) &char
 fn C.vpg_last_error_message() &char
@@ -49,6 +48,14 @@ pub:
 	encoding        string
 	locale          string
 	no_instructions bool
+}
+
+pub struct PGOptions {
+pub:
+	data_dir                 string
+	user                     string
+	db                       string
+	shared_preload_libraries string
 }
 
 fn c_error_string() string {
@@ -93,13 +100,35 @@ pub fn initdb_with_options(data_dir string, options InitDBOptions) ! {
 }
 
 pub fn new_pg_embedded(data_dir string, user string, db string) !PGEmbedded {
+	return new_pg_embedded_with_options(PGOptions{
+		data_dir: data_dir
+		user:     user
+		db:       db
+	})
+}
+
+pub fn new_pg_embedded_with_options(options PGOptions) !PGEmbedded {
 	configure_exec_path()
-	C.vpg_init(data_dir.str, user.str, db.str)
+	user := if options.user.len > 0 { options.user } else { 'postgres' }
+	db := if options.db.len > 0 { options.db } else { user }
+	if options.data_dir.len == 0 {
+		return error('data directory is required')
+	}
+	if user.len == 0 {
+		return error('user is required')
+	}
+	if db.len == 0 {
+		return error('database name is required')
+	}
+
+	shared_preload_libraries := options.shared_preload_libraries
+	C.vpg_backend_start_options(options.data_dir.str, user.str, db.str,
+		shared_preload_libraries.str)
 	if C.vpg_last_error_message() != 0 {
 		return error(c_error_string())
 	}
 	return PGEmbedded{
-		data_dir:    data_dir
+		data_dir:    options.data_dir
 		user:        user
 		db:          db
 		initialized: true

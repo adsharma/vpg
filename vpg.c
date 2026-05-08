@@ -197,23 +197,16 @@ vpg_initdb_options(const char *data_dir,
 }
 
 void
-vpg_initdb(const char *data_dir, const char *username)
+vpg_backend_start_options(const char *data_dir,
+						  const char *username,
+						  const char *dbname,
+						  const char *shared_preload_libraries)
 {
-	vpg_initdb_options(data_dir, username, "trust", "UTF8", "C", true);
-}
-
-void
-vpg_init(const char *data_dir, const char *username, const char *dbname)
-{
-	const char *effective_dbname;
-
 	if (vpg_initialized)
 		return;
 
 	vpg_replace_owned_string(&vpg_last_error, NULL);
 	vpg_runtime_init();
-
-	effective_dbname = (dbname != NULL && dbname[0] != '\0') ? dbname : username;
 
 	PG_TRY();
 	{
@@ -223,12 +216,14 @@ vpg_init(const char *data_dir, const char *username, const char *dbname)
 		InitStandaloneProcess(progname);
 		InitializeGUCOptions();
 		SetConfigOption("data_directory", data_dir, PGC_POSTMASTER, PGC_S_ARGV);
-		SetConfigOption("shared_preload_libraries", "", PGC_POSTMASTER, PGC_S_ARGV);
+		SetConfigOption("shared_preload_libraries",
+						shared_preload_libraries != NULL ? shared_preload_libraries : "",
+						PGC_POSTMASTER, PGC_S_ARGV);
 
-		if (effective_dbname == NULL || effective_dbname[0] == '\0')
+		if (dbname == NULL || dbname[0] == '\0')
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("no database name or username provided")));
+					 errmsg("no database name provided")));
 
 		if (!SelectConfigFiles(data_dir, progname))
 			proc_exit(1);
@@ -263,7 +258,7 @@ vpg_init(const char *data_dir, const char *username, const char *dbname)
 		whereToSendOutput = DestNone;
 		BaseInit();
 		sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
-		InitPostgres(effective_dbname, InvalidOid, username, InvalidOid, 0, NULL);
+		InitPostgres(dbname, InvalidOid, username, InvalidOid, 0, NULL);
 		SetProcessingMode(NormalProcessing);
 
 		vpg_initialized = true;

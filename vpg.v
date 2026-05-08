@@ -23,18 +23,19 @@ import os
 #flag -lz
 #flag -lm
 #flag linux -latomic
+#flag linux -lpthread
 
 fn C.vpg_initdb_options(data_dir &char, username &char, auth &char, encoding &char, locale &char, no_instructions bool)
-fn C.vpg_backend_start_options(data_dir &char, username &char, dbname &char, shared_preload_libraries &char)
+fn C.vpg_connect_options(data_dir &char, username &char, dbname &char, shared_preload_libraries &char) voidptr
 fn C.vpg_set_exec_path(path &char)
 fn C.vpg_set_python_error(message &char)
 fn C.vpg_python_error() &char
-fn C.vpg_exec(query &char) &char
-fn C.vpg_vacuum() int
-fn C.vpg_analyze() int
-fn C.vpg_maintain() int
+fn C.vpg_conn_exec(handle voidptr, query &char) &char
+fn C.vpg_conn_vacuum(handle voidptr) int
+fn C.vpg_conn_analyze(handle voidptr) int
+fn C.vpg_conn_maintain(handle voidptr) int
+fn C.vpg_conn_close(handle voidptr)
 fn C.vpg_last_error_message() &char
-fn C.vpg_finish()
 fn C.vpg_free(ptr voidptr)
 
 @[heap]
@@ -45,6 +46,7 @@ pub:
 	db       string
 mut:
 	initialized bool
+	handle      voidptr
 }
 
 pub struct InitDBOptions {
@@ -128,9 +130,8 @@ pub fn new_pg_embedded_with_options(options PGOptions) !PGEmbedded {
 	}
 
 	shared_preload_libraries := options.shared_preload_libraries
-	C.vpg_backend_start_options(options.data_dir.str, user.str, db.str,
-		shared_preload_libraries.str)
-	if C.vpg_last_error_message() != 0 {
+	handle := C.vpg_connect_options(options.data_dir.str, user.str, db.str, shared_preload_libraries.str)
+	if handle == 0 {
 		return error(c_error_string())
 	}
 	return PGEmbedded{
@@ -138,6 +139,7 @@ pub fn new_pg_embedded_with_options(options PGOptions) !PGEmbedded {
 		user:        user
 		db:          db
 		initialized: true
+		handle:      handle
 	}
 }
 
@@ -146,7 +148,7 @@ pub fn (mut pg PGEmbedded) query(query_text string) !string {
 		return error('PG not initialized')
 	}
 
-	c_result := C.vpg_exec(query_text.str)
+	c_result := C.vpg_conn_exec(pg.handle, query_text.str)
 	if c_result == 0 {
 		return error(c_error_string())
 	}
@@ -160,7 +162,7 @@ pub fn (mut pg PGEmbedded) vacuum() ! {
 	if !pg.initialized {
 		return error('PG not initialized')
 	}
-	if C.vpg_vacuum() != 0 {
+	if C.vpg_conn_vacuum(pg.handle) != 0 {
 		return error(c_error_string())
 	}
 }
@@ -169,7 +171,7 @@ pub fn (mut pg PGEmbedded) analyze() ! {
 	if !pg.initialized {
 		return error('PG not initialized')
 	}
-	if C.vpg_analyze() != 0 {
+	if C.vpg_conn_analyze(pg.handle) != 0 {
 		return error(c_error_string())
 	}
 }
@@ -178,7 +180,7 @@ pub fn (mut pg PGEmbedded) maintain() ! {
 	if !pg.initialized {
 		return error('PG not initialized')
 	}
-	if C.vpg_maintain() != 0 {
+	if C.vpg_conn_maintain(pg.handle) != 0 {
 		return error(c_error_string())
 	}
 }
@@ -187,7 +189,8 @@ pub fn (mut pg PGEmbedded) close() {
 	if !pg.initialized {
 		return
 	}
-	C.vpg_finish()
+	C.vpg_conn_close(pg.handle)
+	pg.handle = voidptr(0)
 	pg.initialized = false
 }
 
@@ -218,15 +221,15 @@ pub fn py_open(data_dir &char, user &char, db &char) voidptr {
 		C.vpg_set_python_error(c'data directory is required')
 		return 0
 	}
-	C.vpg_backend_start_options(data_dir_v.str, user_v.str, db_v.str, c'')
-	if C.vpg_last_error_message() != 0 {
+	handle := C.vpg_connect_options(data_dir_v.str, user_v.str, db_v.str, c'')
+	if handle == 0 {
 		msg := C.vpg_last_error_message()
 		if msg != 0 {
 			C.vpg_set_python_error(msg)
 		}
 		return 0
 	}
-	return voidptr(1)
+	return handle
 }
 
 @[export: 'vpg_py_initdb']
@@ -257,7 +260,7 @@ pub fn py_query(handle voidptr, query &char) &char {
 		C.vpg_set_python_error(c'PG handle is null')
 		return 0
 	}
-	c_result := C.vpg_exec(query)
+	c_result := C.vpg_conn_exec(handle, query)
 	if c_result == 0 {
 		msg := C.vpg_last_error_message()
 		if msg != 0 {
@@ -268,12 +271,12 @@ pub fn py_query(handle voidptr, query &char) &char {
 	return c_result
 }
 
-fn py_maintenance(handle voidptr, action fn () int) int {
+fn py_maintenance(handle voidptr, action fn (voidptr) int) int {
 	if handle == 0 {
 		C.vpg_set_python_error(c'PG handle is null')
 		return -1
 	}
-	rc := action()
+	rc := action(handle)
 	if rc != 0 {
 		msg := C.vpg_last_error_message()
 		if msg != 0 {
@@ -286,26 +289,26 @@ fn py_maintenance(handle voidptr, action fn () int) int {
 @[export: 'vpg_py_vacuum']
 @[py_export]
 pub fn py_vacuum(handle voidptr) int {
-	return py_maintenance(handle, C.vpg_vacuum)
+	return py_maintenance(handle, C.vpg_conn_vacuum)
 }
 
 @[export: 'vpg_py_analyze']
 @[py_export]
 pub fn py_analyze(handle voidptr) int {
-	return py_maintenance(handle, C.vpg_analyze)
+	return py_maintenance(handle, C.vpg_conn_analyze)
 }
 
 @[export: 'vpg_py_maintain']
 @[py_export]
 pub fn py_maintain(handle voidptr) int {
-	return py_maintenance(handle, C.vpg_maintain)
+	return py_maintenance(handle, C.vpg_conn_maintain)
 }
 
 @[export: 'vpg_py_close']
 @[py_export]
 pub fn py_close(handle voidptr) {
 	if handle != 0 {
-		C.vpg_finish()
+		C.vpg_conn_close(handle)
 	}
 }
 

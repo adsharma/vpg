@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,7 +36,18 @@ static bool vpg_runtime_ready = false;
 static char *vpg_last_error = NULL;
 static char *vpg_python_last_error = NULL;
 static char *vpg_exec_path = NULL;
+static pthread_mutex_t vpg_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int vpg_connection_count = 0;
+static char *vpg_active_data_dir = NULL;
 const char *progname = "vpg";
+
+typedef struct VPGConnection
+{
+	bool		open;
+	char	   *data_dir;
+	char	   *username;
+	char	   *dbname;
+} VPGConnection;
 
 DispatchOption
 parse_dispatch_option(const char *name)
@@ -79,6 +91,12 @@ static char *
 vpg_strdup_result(const char *value)
 {
 	return strdup(value != NULL ? value : "");
+}
+
+static bool
+vpg_valid_connection(VPGConnection *conn)
+{
+	return conn != NULL && conn->open;
 }
 
 const char *
@@ -150,6 +168,15 @@ vpg_free(void *ptr)
 	free(ptr);
 }
 
+static void
+vpg_backend_start_options_unlocked(const char *data_dir,
+								   const char *username,
+								   const char *dbname,
+								   const char *shared_preload_libraries);
+static const char *vpg_exec_unlocked(const char *query);
+static int vpg_run_vacuum_unlocked(bits32 options);
+static void vpg_finish_unlocked(void);
+
 const char *
 vpg_last_error_message(void)
 {
@@ -189,6 +216,7 @@ vpg_initdb_options(const char *data_dir,
 
 	vpg_replace_owned_string(&vpg_last_error, NULL);
 	vpg_runtime_init();   /* ensure MemoryContextInit before any palloc */
+	pqsignal(SIGUSR1, SIG_IGN);
 
 	snprintf(auth_arg, sizeof(auth_arg), "--auth=%s",
 			 auth != NULL && auth[0] != '\0' ? auth : "trust");
@@ -215,6 +243,7 @@ vpg_initdb_options(const char *data_dir,
 	else
 	{
 		pqsignal(SIGUSR1, procsignal_sigusr1_handler);
+		vpg_replace_owned_string(&vpg_active_data_dir, data_dir);
 		vpg_initialized = true;
 	}
 }
@@ -224,6 +253,17 @@ vpg_backend_start_options(const char *data_dir,
 						  const char *username,
 						  const char *dbname,
 						  const char *shared_preload_libraries)
+{
+	pthread_mutex_lock(&vpg_mutex);
+	vpg_backend_start_options_unlocked(data_dir, username, dbname, shared_preload_libraries);
+	pthread_mutex_unlock(&vpg_mutex);
+}
+
+static void
+vpg_backend_start_options_unlocked(const char *data_dir,
+								   const char *username,
+								   const char *dbname,
+								   const char *shared_preload_libraries)
 {
 	if (vpg_initialized)
 		return;
@@ -284,6 +324,7 @@ vpg_backend_start_options(const char *data_dir,
 		InitPostgres(dbname, InvalidOid, username, InvalidOid, 0, NULL);
 		SetProcessingMode(NormalProcessing);
 
+		vpg_replace_owned_string(&vpg_active_data_dir, data_dir);
 		vpg_initialized = true;
 	}
 	PG_CATCH();
@@ -296,6 +337,17 @@ vpg_backend_start_options(const char *data_dir,
 
 const char *
 vpg_exec(const char *query)
+{
+	const char *result;
+
+	pthread_mutex_lock(&vpg_mutex);
+	result = vpg_exec_unlocked(query);
+	pthread_mutex_unlock(&vpg_mutex);
+	return result;
+}
+
+static const char *
+vpg_exec_unlocked(const char *query)
 {
 	StringInfoData buf;
 	char	   *result;
@@ -388,6 +440,17 @@ vpg_exec(const char *query)
 static int
 vpg_run_vacuum(bits32 options)
 {
+	int rc;
+
+	pthread_mutex_lock(&vpg_mutex);
+	rc = vpg_run_vacuum_unlocked(options);
+	pthread_mutex_unlock(&vpg_mutex);
+	return rc;
+}
+
+static int
+vpg_run_vacuum_unlocked(bits32 options)
+{
 	int			rc = 0;
 
 	if (!vpg_initialized)
@@ -466,11 +529,16 @@ vpg_maintain(void)
 {
 	int rc = 0;
 
-	if (vpg_run_vacuum(VACOPT_VACUUM |
-					   VACOPT_ANALYZE |
-					   VACOPT_PROCESS_MAIN |
-					   VACOPT_PROCESS_TOAST) != 0)
+	pthread_mutex_lock(&vpg_mutex);
+
+	if (vpg_run_vacuum_unlocked(VACOPT_VACUUM |
+								VACOPT_ANALYZE |
+								VACOPT_PROCESS_MAIN |
+								VACOPT_PROCESS_TOAST) != 0)
+	{
+		pthread_mutex_unlock(&vpg_mutex);
 		return -1;
+	}
 
 	PG_TRY();
 	{
@@ -489,11 +557,208 @@ vpg_maintain(void)
 	}
 	PG_END_TRY();
 
+	pthread_mutex_unlock(&vpg_mutex);
+	return rc;
+}
+
+void *
+vpg_connect_options(const char *data_dir,
+					const char *username,
+					const char *dbname,
+					const char *shared_preload_libraries)
+{
+	VPGConnection *conn;
+
+	pthread_mutex_lock(&vpg_mutex);
+	vpg_replace_owned_string(&vpg_last_error, NULL);
+
+	if (data_dir == NULL || data_dir[0] == '\0')
+	{
+		vpg_replace_owned_string(&vpg_last_error, "data directory is required");
+		pthread_mutex_unlock(&vpg_mutex);
+		return NULL;
+	}
+
+	if (vpg_initialized &&
+		vpg_active_data_dir != NULL &&
+		strcmp(vpg_active_data_dir, data_dir) != 0)
+	{
+		vpg_replace_owned_string(&vpg_last_error,
+								 "only one embedded data directory can be open in a process");
+		pthread_mutex_unlock(&vpg_mutex);
+		return NULL;
+	}
+
+	vpg_backend_start_options_unlocked(data_dir, username, dbname, shared_preload_libraries);
+	if (vpg_last_error != NULL)
+	{
+		pthread_mutex_unlock(&vpg_mutex);
+		return NULL;
+	}
+
+	conn = calloc(1, sizeof(VPGConnection));
+	if (conn == NULL)
+	{
+		vpg_replace_owned_string(&vpg_last_error, "out of memory allocating connection");
+		pthread_mutex_unlock(&vpg_mutex);
+		return NULL;
+	}
+
+	conn->open = true;
+	conn->data_dir = strdup(data_dir);
+	conn->username = strdup(username != NULL && username[0] != '\0' ? username : "postgres");
+	conn->dbname = strdup(dbname != NULL && dbname[0] != '\0' ? dbname : conn->username);
+	if (conn->data_dir == NULL || conn->username == NULL || conn->dbname == NULL)
+	{
+		free(conn->data_dir);
+		free(conn->username);
+		free(conn->dbname);
+		free(conn);
+		vpg_replace_owned_string(&vpg_last_error, "out of memory allocating connection");
+		pthread_mutex_unlock(&vpg_mutex);
+		return NULL;
+	}
+
+	vpg_connection_count++;
+	pthread_mutex_unlock(&vpg_mutex);
+	return conn;
+}
+
+const char *
+vpg_conn_exec(void *handle, const char *query)
+{
+	const char *result;
+	VPGConnection *conn = (VPGConnection *) handle;
+
+	pthread_mutex_lock(&vpg_mutex);
+	if (!vpg_valid_connection(conn))
+	{
+		vpg_replace_owned_string(&vpg_last_error, "connection is closed");
+		pthread_mutex_unlock(&vpg_mutex);
+		return NULL;
+	}
+	result = vpg_exec_unlocked(query);
+	pthread_mutex_unlock(&vpg_mutex);
+	return result;
+}
+
+int
+vpg_conn_vacuum(void *handle)
+{
+	int rc;
+	VPGConnection *conn = (VPGConnection *) handle;
+
+	pthread_mutex_lock(&vpg_mutex);
+	if (!vpg_valid_connection(conn))
+	{
+		vpg_replace_owned_string(&vpg_last_error, "connection is closed");
+		pthread_mutex_unlock(&vpg_mutex);
+		return -1;
+	}
+	rc = vpg_run_vacuum_unlocked(VACOPT_VACUUM |
+								 VACOPT_PROCESS_MAIN |
+								 VACOPT_PROCESS_TOAST);
+	pthread_mutex_unlock(&vpg_mutex);
+	return rc;
+}
+
+int
+vpg_conn_analyze(void *handle)
+{
+	int rc;
+	VPGConnection *conn = (VPGConnection *) handle;
+
+	pthread_mutex_lock(&vpg_mutex);
+	if (!vpg_valid_connection(conn))
+	{
+		vpg_replace_owned_string(&vpg_last_error, "connection is closed");
+		pthread_mutex_unlock(&vpg_mutex);
+		return -1;
+	}
+	rc = vpg_run_vacuum_unlocked(VACOPT_ANALYZE |
+								 VACOPT_PROCESS_MAIN |
+								 VACOPT_PROCESS_TOAST);
+	pthread_mutex_unlock(&vpg_mutex);
+	return rc;
+}
+
+int
+vpg_conn_maintain(void *handle)
+{
+	int rc = 0;
+	VPGConnection *conn = (VPGConnection *) handle;
+
+	pthread_mutex_lock(&vpg_mutex);
+	if (!vpg_valid_connection(conn))
+	{
+		vpg_replace_owned_string(&vpg_last_error, "connection is closed");
+		pthread_mutex_unlock(&vpg_mutex);
+		return -1;
+	}
+	if (vpg_run_vacuum_unlocked(VACOPT_VACUUM |
+								VACOPT_ANALYZE |
+								VACOPT_PROCESS_MAIN |
+								VACOPT_PROCESS_TOAST) != 0)
+	{
+		pthread_mutex_unlock(&vpg_mutex);
+		return -1;
+	}
+
+	PG_TRY();
+	{
+		StartTransactionCommand();
+		RequestCheckpoint(CHECKPOINT_IMMEDIATE |
+						  CHECKPOINT_FORCE |
+						  CHECKPOINT_WAIT);
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		vpg_capture_current_error();
+		AbortCurrentTransaction();
+		rc = -1;
+	}
+	PG_END_TRY();
+
+	pthread_mutex_unlock(&vpg_mutex);
 	return rc;
 }
 
 void
+vpg_conn_close(void *handle)
+{
+	VPGConnection *conn = (VPGConnection *) handle;
+
+	if (conn == NULL)
+		return;
+
+	pthread_mutex_lock(&vpg_mutex);
+	if (conn->open)
+	{
+		conn->open = false;
+		if (vpg_connection_count > 0)
+			vpg_connection_count--;
+		if (vpg_connection_count == 0)
+			vpg_finish_unlocked();
+	}
+	pthread_mutex_unlock(&vpg_mutex);
+
+	free(conn->data_dir);
+	free(conn->username);
+	free(conn->dbname);
+	free(conn);
+}
+
+void
 vpg_finish(void)
+{
+	pthread_mutex_lock(&vpg_mutex);
+	vpg_finish_unlocked();
+	pthread_mutex_unlock(&vpg_mutex);
+}
+
+static void
+vpg_finish_unlocked(void)
 {
 	if (!vpg_initialized)
 		return;
@@ -511,4 +776,5 @@ vpg_finish(void)
 	PG_END_TRY();
 
 	vpg_initialized = false;
+	vpg_replace_owned_string(&vpg_active_data_dir, NULL);
 }

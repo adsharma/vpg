@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import os
+import queue
+import threading
 from pathlib import Path
 from cffi import FFI
 
@@ -33,6 +35,44 @@ def _load_library():
 
 
 lib = _load_library()
+_task_queue: queue.Queue = queue.Queue()
+_worker_lock = threading.Lock()
+_worker_started = False
+_worker_state = threading.local()
+
+
+def _db_worker() -> None:
+    _worker_state.in_worker = True
+    while True:
+        fn, args, result_queue = _task_queue.get()
+        try:
+            result_queue.put((True, fn(*args)))
+        except BaseException as exc:
+            result_queue.put((False, exc))
+
+
+def _ensure_worker() -> None:
+    global _worker_started
+    if _worker_started:
+        return
+    with _worker_lock:
+        if _worker_started:
+            return
+        thread = threading.Thread(target=_db_worker, name="vpg-db", daemon=True)
+        thread.start()
+        _worker_started = True
+
+
+def _call(fn, *args):
+    if getattr(_worker_state, "in_worker", False):
+        return fn(*args)
+    _ensure_worker()
+    result_queue: queue.Queue = queue.Queue(maxsize=1)
+    _task_queue.put((fn, args, result_queue))
+    ok, value = result_queue.get()
+    if ok:
+        return value
+    raise value
 
 
 def _tool_path(name: str) -> Path:
@@ -42,7 +82,7 @@ def _tool_path(name: str) -> Path:
 def _set_exec_path(name: str) -> None:
     path = _tool_path(name)
     if path.exists():
-        lib.vpg_py_set_exec_path(str(path).encode("utf-8"))
+        _call(lib.vpg_py_set_exec_path, str(path).encode("utf-8"))
 
 
 def _bytes(value: str | bytes) -> bytes:
@@ -52,7 +92,7 @@ def _bytes(value: str | bytes) -> bytes:
 
 
 def _last_error() -> str:
-    raw = lib.vpg_py_last_error()
+    raw = _call(lib.vpg_py_last_error)
     if raw == ffi.NULL:
         return "unknown vpg error"
     return ffi.string(raw).decode("utf-8", errors="replace")
@@ -64,7 +104,7 @@ class VPGError(RuntimeError):
 
 def initdb(data_dir: str, user: str = "postgres") -> None:
     _set_exec_path("initdb")
-    rc = lib.vpg_py_initdb(_bytes(data_dir), _bytes(user))
+    rc = _call(lib.vpg_py_initdb, _bytes(data_dir), _bytes(user))
     if rc != 0:
         raise VPGError(_last_error())
 
@@ -72,34 +112,36 @@ def initdb(data_dir: str, user: str = "postgres") -> None:
 class EmbeddedPostgres:
     def __init__(self, data_dir: str, user: str = "postgres", db: str = "postgres"):
         _set_exec_path("postgres")
-        self._handle = lib.vpg_py_open(_bytes(data_dir), _bytes(user), _bytes(db))
+        self._handle = _call(lib.vpg_py_open, _bytes(data_dir), _bytes(user), _bytes(db))
         if self._handle == ffi.NULL:
             raise VPGError(_last_error())
 
     def query(self, sql: str) -> str:
-        result = lib.vpg_py_query(self._handle, _bytes(sql))
-        if result == ffi.NULL:
-            raise VPGError(_last_error())
-        try:
-            return ffi.string(result).decode("utf-8")
-        finally:
-            lib.vpg_py_free(result)
+        def run_query():
+            result = lib.vpg_py_query(self._handle, _bytes(sql))
+            if result == ffi.NULL:
+                raise VPGError(_last_error())
+            try:
+                return ffi.string(result).decode("utf-8")
+            finally:
+                lib.vpg_py_free(result)
+        return _call(run_query)
 
     def vacuum(self) -> None:
-        if lib.vpg_py_vacuum(self._handle) != 0:
+        if _call(lib.vpg_py_vacuum, self._handle) != 0:
             raise VPGError(_last_error())
 
     def analyze(self) -> None:
-        if lib.vpg_py_analyze(self._handle) != 0:
+        if _call(lib.vpg_py_analyze, self._handle) != 0:
             raise VPGError(_last_error())
 
     def maintain(self) -> None:
-        if lib.vpg_py_maintain(self._handle) != 0:
+        if _call(lib.vpg_py_maintain, self._handle) != 0:
             raise VPGError(_last_error())
 
     def close(self) -> None:
         if self._handle != ffi.NULL:
-            lib.vpg_py_close(self._handle)
+            _call(lib.vpg_py_close, self._handle)
             self._handle = ffi.NULL
 
     def __enter__(self) -> "EmbeddedPostgres":

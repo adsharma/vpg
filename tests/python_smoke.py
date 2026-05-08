@@ -1,5 +1,6 @@
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 
@@ -21,6 +22,24 @@ def main() -> None:
             pg.vacuum()
             pg.analyze()
             pg.maintain()
+
+            def insert_from_connection(worker_id: int) -> None:
+                with vpg.EmbeddedPostgres(data_dir) as worker_pg:
+                    worker_pg.query(
+                        f"INSERT INTO py_people (id, name) VALUES ({worker_id + 10}, 'worker-{worker_id}');"
+                    )
+
+            threads = [
+                threading.Thread(target=insert_from_connection, args=(worker_id,))
+                for worker_id in range(4)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            count = pg.query("SELECT count(*) FROM py_people;")
+            assert "6" in count
 
 
 if __name__ == "__main__":

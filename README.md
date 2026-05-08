@@ -1,6 +1,6 @@
 # vPG – Single‑Process Postgres Wrapper (Vlang)
 
-A thin Vlang layer that boots PostgreSQL 18.1 in standalone (single‑user) mode and exposes a simple API to run arbitrary SQL queries and collect data from p
+A thin Vlang layer that boots PostgreSQL 18.1 in standalone (single‑user) mode and exposes a simple API to run arbitrary SQL queries and collect result rows.
 
 ## Overview
 - Uses the PostgreSQL source as a git submodule at `./postgresql` (REL_18_1).
